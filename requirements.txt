@@ -1,0 +1,2 @@
+# App deps only. Inference runs in the Obico ml_api Docker container (see README).
+Pillow>=10.0.0

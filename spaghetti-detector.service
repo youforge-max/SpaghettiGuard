@@ -1,0 +1,17 @@
+[Unit]
+Description=Spaghetti Detector — SV08 print-failure monitor (Obico ml_api client)
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=youruser
+WorkingDirectory=/home/youruser/spaghetti-detector
+EnvironmentFile=/home/youruser/spaghetti-detector/.env
+ExecStart=/home/youruser/spaghetti-detector/venv/bin/python app.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
