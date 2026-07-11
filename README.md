@@ -1,50 +1,138 @@
-# 🍝 Spaghetti Detector
+# 🍝 SpaghettiGuard
 
-Self-hosted, no-cloud, free print-failure ("spaghetti") monitor for the Sovol SV08.
-Polls the printer webcam, runs a YOLO model on each frame, and raises a debounced
-**ALERT** when a failure is seen on N consecutive frames. Small dark dashboard on
-`:8110` shows the live annotated frame + status. Notify-only by default; optional
-Moonraker auto-pause and email.
+![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
+![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue)
+![Docker required](https://img.shields.io/badge/docker-required-2496ED?logo=docker&logoColor=white)
+![Self-hosted](https://img.shields.io/badge/self--hosted-yes-brightgreen)
+![No cloud](https://img.shields.io/badge/cloud-none-brightgreen)
+![Cost](https://img.shields.io/badge/cost-free-brightgreen)
 
-Runs on the workstation GPU box (GTX 1050) but inference defaults to **CPU** — one
-frame every ~6 s is trivial for CPU YOLOv8n, and the 2 GB card has too little free
-VRAM once the desktop is loaded.
+**Self-hosted, no-cloud, free print-failure ("spaghetti") detector for Klipper 3D printers.**
 
-## Layout
+SpaghettiGuard watches your printer's webcam, runs a pretrained failure-detection model
+on each frame, and raises a debounced alert when a print starts turning into spaghetti.
+A small dashboard shows the live annotated camera feed and detector status. Everything
+runs on your own hardware — no accounts, no subscriptions, no images leaving your network.
+
+![SpaghettiGuard detecting a failed print](docs/demo.jpg)
+
+*Live detection: red `failure` boxes over a tangled print; the toolhead and bed are ignored.*
+
+---
+
+## How it works
+
 ```
-app.py            poller thread + stdlib web UI (:8110)
-.env.example      config (copy to .env)
-models/           YOLO weights (.pt) — gitignored
-requirements.txt  ultralytics (pulls torch + opencv)
+Printer webcam (mjpg-streamer)
+      │  snapshot every few seconds
+      ▼
+Obico ml_api  ──►  pretrained ONNX "failure" model (CPU)   [Docker container]
+      │  detections: [[label, confidence, [cx,cy,w,h]], ...]
+      ▼
+SpaghettiGuard app  ──►  debounce ──► draw boxes ──► dashboard :8110
+      │
+      └──► on confirmed failure: log · optional email · optional Moonraker pause
 ```
 
-## Run
+Inference is done by the open-source [Obico](https://github.com/TheSpaghettiDetective/obico-server)
+`ml_api` model — the same failure detector used by The Spaghetti Detective — packaged as a
+small CPU-only Docker container. SpaghettiGuard is the thin, dependency-light layer that polls
+the camera, debounces detections into stable alerts, and gives you a dashboard and actions.
+
+## Features
+
+- **100% self-hosted & free** — no cloud, no API keys, no telemetry.
+- **CPU-only** — no GPU required; ~150–250 ms per frame on a typical CPU.
+- **Debounced alerts** — needs N consecutive positive frames to alert, and M clean frames
+  to clear, so a single noisy frame won't cry wolf.
+- **Notify-only by default** — it never touches your print unless you opt in.
+- **Optional actions** — pause the print via Moonraker and/or send an email on failure.
+- **Tiny dashboard** — live annotated feed, detector health, `/api/status` JSON, `/healthz`.
+
+## Requirements
+
+- A 3D printer running **Klipper + Moonraker** with a webcam exposing an MJPEG **snapshot URL**
+  (e.g. `mjpg-streamer`, common on Mainsail/Fluidd setups).
+- **Docker** (to run the inference container).
+- **Python 3.8+** (to run the app; only dependency is Pillow).
+
+## Install
+
 ```bash
-cd ~/spaghetti-detector
+git clone https://github.com/youforge-max/SpaghettiGuard.git
+cd SpaghettiGuard
+
+# 1) Build + run the Obico ml_api inference container (CPU)
+git clone --depth 1 https://github.com/TheSpaghettiDetective/obico-server.git
+docker build -f obico-server/ml_api/Containerfile.cpu -t obico-ml-cpu obico-server/ml_api
+docker run -d --name obico-ml -p 3333:3333 --restart unless-stopped obico-ml-cpu
+
+# 2) Set up the app
 python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
-cp .env.example .env            # edit MODEL_PATH / DEVICE / thresholds
+cp .env.example .env          # then edit SNAPSHOT_URL to your printer's webcam
 ./venv/bin/python app.py
+
 # open http://localhost:8110
 ```
 
-## The weights problem
-Stock `yolov8n.pt` (COCO classes) **cannot** detect spaghetti — use it only to prove
-the pipeline. A real detector needs spaghetti-trained weights. Options, all free /
-local at runtime:
+Find your snapshot URL in your printer's webcam settings — it usually looks like
+`http://<printer-ip>/webcam/?action=snapshot`.
 
-1. **Obico `ml_api`** — the maintained open-source Spaghetti Detective model
-   (Darknet YOLO), shipped as a Docker container with its trained weights. CPU-capable,
-   self-hosted, no cloud. Point this app's detector at its `/p/` endpoint. *(recommended
-   for actual detection)*
-2. **Train YOLOv8n** on a labelled 3D-print-failure dataset (e.g. Roboflow Universe
-   "3d-printing-flaws", ~9.4k images). Needs a GPU with ≥6 GB VRAM to train in
-   reasonable time — the local 1050 (2 GB) can't; train elsewhere, then drop `best.pt`
-   into `models/`.
+## Configuration (`.env`)
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `SNAPSHOT_URL` | — | Printer webcam MJPEG snapshot URL (**set this**) |
+| `ML_API_URL` | `http://127.0.0.1:3333` | Obico ml_api endpoint |
+| `ML_API_TOKEN` | *(blank)* | Only if you set a token on the container |
+| `PORT` | `8110` | Dashboard port |
+| `CONF` | `0.25` | Min confidence for a frame to count as a positive |
+| `POLL_SEC` | `6` | Seconds between webcam grabs |
+| `ALERT_STREAK` | `3` | Consecutive positive frames before ALERT |
+| `CLEAR_STREAK` | `5` | Consecutive clean frames to clear an alert |
+| `AUTO_PAUSE` | `0` | `1` = pause the print via Moonraker on alert |
+| `MOONRAKER_URL` | — | Moonraker base URL (for auto-pause) |
+| `SMTP_*`, `ALERT_EMAIL_TO` | *(blank)* | Optional email alerts |
+
+> **Note:** systemd's `EnvironmentFile` does not strip inline `# comments` — keep values on
+> their own line in `.env`.
 
 ## Alerting
-- Debounce: `ALERT_STREAK` positive frames → ALERT; `CLEAR_STREAK` clean frames → clear.
-- `AUTO_PAUSE=1` sends Moonraker `printer/print/pause` on alert (default off — notify-only).
-- SMTP block (reuses the SOC gmail pattern) sends an email if configured.
+
+- Debounce: `ALERT_STREAK` positive frames → **ALERT**; `CLEAR_STREAK` clean frames → clear.
+- `AUTO_PAUSE=1` sends Moonraker `printer/print/pause` when a failure is confirmed
+  (off by default — start in notify-only mode until you trust the detector on your printer).
+- Fill the `SMTP_*` block to receive an email on failure.
+
+## Run as a service (optional)
+
+A `spaghetti-detector.service` unit is included. Edit the paths/user to match your system,
+then:
+
+```bash
+sudo cp spaghetti-detector.service /etc/systemd/system/
+sudo systemctl enable --now spaghetti-detector
+```
 
 ## Endpoints
-`/` dashboard · `/snapshot.jpg` latest annotated frame · `/api/status` JSON · `/healthz`
+
+| Path | Purpose |
+|------|---------|
+| `/` | Dashboard |
+| `/snapshot.jpg` | Latest annotated frame |
+| `/api/status` | Detector status (JSON) |
+| `/healthz` | Health check |
+
+## Tuning
+
+Start with the defaults. If you get false positives, raise `CONF` or `ALERT_STREAK`.
+If it misses failures, lower them. Enable `AUTO_PAUSE` only after you've seen it reliably
+catch failures on your own printer and lighting.
+
+## Credits
+
+- Failure-detection model & `ml_api`: [Obico / The Spaghetti Detective](https://github.com/TheSpaghettiDetective/obico-server) (AGPL).
+- SpaghettiGuard app: MIT (see [LICENSE](LICENSE)).
+
+> This project is not affiliated with or endorsed by Obico. It simply runs their
+> open-source model container locally.
