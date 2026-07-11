@@ -31,7 +31,7 @@ Obico ml_api  ──►  pretrained ONNX "failure" model (CPU)   [Docker contain
       ▼
 SpaghettiGuard app  ──►  debounce ──► draw boxes ──► dashboard :8110
       │
-      └──► on confirmed failure: log · optional email · optional Moonraker pause
+      └──► on confirmed failure: log · Moonraker pause (on by default) · optional email
 ```
 
 Inference is done by the open-source [Obico](https://github.com/TheSpaghettiDetective/obico-server)
@@ -45,8 +45,11 @@ the camera, debounces detections into stable alerts, and gives you a dashboard a
 - **CPU-only** — no GPU required; ~150–250 ms per frame on a typical CPU.
 - **Debounced alerts** — needs N consecutive positive frames to alert, and M clean frames
   to clear, so a single noisy frame won't cry wolf.
-- **Notify-only by default** — it never touches your print unless you opt in.
-- **Optional actions** — pause the print via Moonraker and/or send an email on failure.
+- **Stops the bleeding** — on a confirmed failure it pauses the print via Moonraker.
+  On by default; flip it to notify-only whenever you like.
+- **Live auto-pause toggle** — switch it on/off from the dashboard (or `POST /api/auto_pause`)
+  without restarting the service or editing `.env`.
+- **Optional email** — get mailed when a failure is confirmed.
 - **Tiny dashboard** — live annotated feed, detector health, `/api/status` JSON, `/healthz`.
 
 ## Requirements
@@ -90,8 +93,8 @@ Find your snapshot URL in your printer's webcam settings — it usually looks li
 | `POLL_SEC` | `6` | Seconds between webcam grabs |
 | `ALERT_STREAK` | `3` | Consecutive positive frames before ALERT |
 | `CLEAR_STREAK` | `5` | Consecutive clean frames to clear an alert |
-| `AUTO_PAUSE` | `0` | `1` = pause the print via Moonraker on alert |
-| `MOONRAKER_URL` | — | Moonraker base URL (for auto-pause) |
+| `AUTO_PAUSE` | `1` | Pause the print via Moonraker on alert. `0` = notify-only. **Starting value only** — toggleable at runtime |
+| `MOONRAKER_URL` | — | Moonraker base URL (**set this** if auto-pause is on) |
 | `SMTP_*`, `ALERT_EMAIL_TO` | *(blank)* | Optional email alerts |
 
 > **Note:** systemd's `EnvironmentFile` does not strip inline `# comments` — keep values on
@@ -99,10 +102,33 @@ Find your snapshot URL in your printer's webcam settings — it usually looks li
 
 ## Alerting
 
-- Debounce: `ALERT_STREAK` positive frames → **ALERT**; `CLEAR_STREAK` clean frames → clear.
-- `AUTO_PAUSE=1` sends Moonraker `printer/print/pause` when a failure is confirmed
-  (off by default — start in notify-only mode until you trust the detector on your printer).
-- Fill the `SMTP_*` block to receive an email on failure.
+Debounce: `ALERT_STREAK` positive frames → **ALERT**; `CLEAR_STREAK` clean frames → clear.
+
+On a confirmed failure SpaghettiGuard sends Moonraker `printer/print/pause`, and emails you
+if the `SMTP_*` block is filled in.
+
+### Auto-pause
+
+Auto-pause is **on by default**, so a false positive can pause a healthy print. That is the
+intended trade — a paused print is recoverable, a bed full of spaghetti is not. If you'd
+rather watch it prove itself first, start in notify-only mode with `AUTO_PAUSE=0`.
+
+`AUTO_PAUSE` only sets the value the app *starts* with. After that it's a live toggle:
+
+- **Dashboard** — the *Auto-pause print* button in the status panel.
+- **API** — `POST /api/auto_pause` with `{"enabled": true|false}`.
+
+```bash
+curl -X POST http://localhost:8110/api/auto_pause \
+     -H 'Content-Type: application/json' -d '{"enabled": false}'
+# -> {"auto_pause": false}
+```
+
+The current value is always in `/api/status` as `auto_pause`. It is **not** persisted —
+a restart goes back to whatever `AUTO_PAUSE` says in `.env`.
+
+> Auto-pause needs `MOONRAKER_URL` pointing at your printer. If it's wrong, the pause
+> request fails and is logged as an error — the alert itself still fires.
 
 ## Run as a service (optional)
 
@@ -116,18 +142,35 @@ sudo systemctl enable --now spaghetti-detector
 
 ## Endpoints
 
-| Path | Purpose |
-|------|---------|
-| `/` | Dashboard |
-| `/snapshot.jpg` | Latest annotated frame |
-| `/api/status` | Detector status (JSON) |
-| `/healthz` | Health check |
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/` | Dashboard |
+| `GET` | `/snapshot.jpg` | Latest annotated frame |
+| `GET` | `/api/status` | Detector status (JSON), including `auto_pause` |
+| `GET` | `/healthz` | Health check |
+| `POST` | `/api/auto_pause` | Toggle auto-pause — body `{"enabled": true\|false}` |
+
+There is no authentication. Keep it on your LAN, behind a reverse proxy, or firewalled —
+anything that can reach the port can toggle auto-pause.
 
 ## Tuning
 
 Start with the defaults. If you get false positives, raise `CONF` or `ALERT_STREAK`.
-If it misses failures, lower them. Enable `AUTO_PAUSE` only after you've seen it reliably
-catch failures on your own printer and lighting.
+If it misses failures, lower them.
+
+Detection quality is mostly about the camera: a stable mount, even lighting, and a view
+that actually frames the part will do more than any threshold. Lighting that changes through
+the print (a window at dusk) is the usual source of false positives.
+
+If you're not yet convinced it can tell spaghetti from your prints, run with `AUTO_PAUSE=0`
+for a few jobs and watch the alerts, then turn it on.
+
+## What it is not
+
+SpaghettiGuard detects **spaghetti and print failures**. It does not tell you whether the
+bed is clear, whether the right part is on it, or whether a print finished cleanly — a
+finished part sitting on the bed produces no detections, exactly like an empty bed does.
+Don't use "no detections" as proof that anything is present or absent.
 
 ## Credits
 

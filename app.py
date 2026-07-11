@@ -6,7 +6,9 @@ Inference is done by a local Obico ml_api container (pretrained ONNX "failure"
 model, CPU). This app polls the printer webcam, asks ml_api to score the frame,
 debounces detections, draws boxes, and serves a small dark dashboard on :8110.
 
-Notify-only by default. Set AUTO_PAUSE=1 to pause the print via Moonraker on alert.
+On a confirmed failure it pauses the print via Moonraker. That is ON by default; set
+AUTO_PAUSE=0 for notify-only. It is also toggleable live from the dashboard
+(POST /api/auto_pause) — the env var only sets the value it starts with.
 """
 import io
 import os
@@ -36,7 +38,7 @@ CFG = {
     "POLL_SEC": float(env("POLL_SEC", "6")),
     "ALERT_STREAK": int(env("ALERT_STREAK", "3")),
     "CLEAR_STREAK": int(env("CLEAR_STREAK", "5")),
-    "AUTO_PAUSE": env("AUTO_PAUSE", "0") == "1",
+    "AUTO_PAUSE": env("AUTO_PAUSE", "1") == "1",   # ON by default; toggleable at runtime
     "MOONRAKER_URL": env("MOONRAKER_URL", "http://192.0.2.72:7125"),
     "SMTP_HOST": env("SMTP_HOST"),
     "SMTP_PORT": int(env("SMTP_PORT", "587")),
@@ -60,6 +62,7 @@ STATE = {
     "max_conf": 0.0,
     "paused_print": False,
     "ml_ok": False,
+    "auto_pause": CFG["AUTO_PAUSE"],   # live-toggleable; env sets only the initial value
 }
 LATEST_JPG = None
 
@@ -127,7 +130,9 @@ def on_alert(max_conf):
         f"Failure detected at {dt.datetime.now().isoformat(timespec='seconds')}\n"
         f"max confidence {max_conf:.2f}\nDashboard: http://<host>:{CFG['PORT']}/",
     )
-    if CFG["AUTO_PAUSE"] and moonraker_pause():
+    with LOCK:
+        want_pause = STATE["auto_pause"]
+    if want_pause and moonraker_pause():
         with LOCK:
             STATE["paused_print"] = True
 
@@ -232,6 +237,13 @@ PAGE = """<!doctype html><html><head><meta charset=utf-8>
  a{color:#58a6ff}
  .badge{padding:2px 10px;border-radius:12px;font-weight:700;font-size:12px}
  .ok{background:#1a3d1a;color:#7ee787}.alert{background:#4d1414;color:#ff7b72}
+ .tgl{margin-top:14px;display:flex;align-items:center;justify-content:space-between;gap:10px;
+      padding-top:12px;border-top:1px solid #21262d}
+ button{background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;
+        padding:5px 14px;font:600 12px system-ui,sans-serif;cursor:pointer}
+ button:hover{border-color:#8b949e}
+ button.on{background:#1a3d1a;color:#7ee787;border-color:#2ea043}
+ .hint{color:#8b949e;font-size:12px;margin:8px 0 0}
 </style></head><body>
 <header>
  <span class=dot id=dot></span>
@@ -242,11 +254,34 @@ PAGE = """<!doctype html><html><head><meta charset=utf-8>
  <div class=cam><img id=cam src="/snapshot.jpg" alt="camera"></div>
  <div class=panel>
   <table id=stats></table>
+  <div class=tgl>
+   <span class=k>Auto-pause print</span>
+   <button id=ap onclick=toggleAP()>…</button>
+  </div>
+  <p class=hint id=aphint></p>
   <p style="margin-top:14px"><a href=/api/status>/api/status</a> · <a href=/healthz>/healthz</a></p>
  </div>
 </div>
 <script>
+ let AP=null;
  function refreshCam(){document.getElementById('cam').src='/snapshot.jpg?t='+Date.now();}
+ function paintAP(on){
+  AP=on;
+  const b=document.getElementById('ap');
+  b.textContent=on?'ON':'OFF';
+  b.className=on?'on':'';
+  document.getElementById('aphint').textContent=on
+   ?'A confirmed failure will pause the print via Moonraker.'
+   :'Notify-only — the print will not be touched.';
+ }
+ async function toggleAP(){
+  if(AP===null)return;
+  try{
+   const r=await fetch('/api/auto_pause',{method:'POST',headers:{'Content-Type':'application/json'},
+                                          body:JSON.stringify({enabled:!AP})});
+   paintAP((await r.json()).auto_pause);
+  }catch(e){}
+ }
  async function refresh(){
   try{
    const s=await (await fetch('/api/status')).json();
@@ -259,10 +294,11 @@ PAGE = """<!doctype html><html><head><meta charset=utf-8>
     ['ml_api',s.ml_ok?'up':'DOWN'],['Score',s.score_ms+' ms'],
     ['Frames',s.frames],['Pos streak',s.pos_streak],['Clean streak',s.clean_streak],
     ['Max conf',s.max_conf],['Detections',s.last_detections.length],
-    ['Auto-pause',s.auto_pause?'ON':'off'],['Paused print',s.paused_print?'YES':'no'],
+    ['Paused print',s.paused_print?'YES':'no'],
     ['Last grab',s.last_grab||'—'],['Last error',s.last_error||'none'],['Started',s.started],
    ];
    document.getElementById('stats').innerHTML=rows.map(r=>`<tr><td class=k>${r[0]}</td><td class=v>${r[1]}</td></tr>`).join('');
+   paintAP(s.auto_pause);
   }catch(e){}
  }
  setInterval(refreshCam,4000);setInterval(refresh,2000);refresh();
@@ -291,7 +327,6 @@ class Handler(BaseHTTPRequestHandler):
         elif p == "/api/status":
             with LOCK:
                 body = dict(STATE)
-                body["auto_pause"] = CFG["AUTO_PAUSE"]
             self._send(200, "application/json", json.dumps(body).encode())
         elif p == "/healthz":
             with LOCK:
@@ -299,6 +334,27 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200 if ok else 503, "text/plain", b"ok" if ok else b"degraded")
         else:
             self._send(404, "text/plain", b"not found")
+
+    def do_POST(self):
+        p = urllib.parse.urlparse(self.path).path
+        if p != "/api/auto_pause":
+            self._send(404, "text/plain", b"not found")
+            return
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            if n > 1024:
+                raise ValueError("body too large")
+            req = json.loads(self.rfile.read(n).decode() or "{}")
+            enabled = req["enabled"]
+            if not isinstance(enabled, bool):
+                raise ValueError("'enabled' must be a boolean")
+        except (ValueError, KeyError, UnicodeDecodeError) as e:
+            self._send(400, "application/json", json.dumps({"error": str(e)}).encode())
+            return
+        with LOCK:
+            STATE["auto_pause"] = enabled
+        log(f"auto-pause toggled {'ON' if enabled else 'OFF'} via API")
+        self._send(200, "application/json", json.dumps({"auto_pause": enabled}).encode())
 
 
 def main():
