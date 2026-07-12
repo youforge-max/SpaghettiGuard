@@ -63,6 +63,10 @@ STATE = {
     "paused_print": False,
     "ml_ok": False,
     "auto_pause": CFG["AUTO_PAUSE"],   # live-toggleable; env sets only the initial value
+    "conf": CFG["CONF"],               # live-toggleable min confidence (sensitivity)
+    "printer_state": "?",              # from Moonraker print_stats: printing/paused/complete/standby/...
+    "printer_file": None,
+    "printer_ok": False,               # False = Moonraker unreachable
 }
 LATEST_JPG = None
 
@@ -91,6 +95,17 @@ def score_via_mlapi():
     raw = http_get(url, timeout=20, headers=headers)
     data = json.loads(raw.decode())
     return data.get("detections", [])
+
+
+def moonraker_print_state():
+    """Return (state, filename) from Moonraker print_stats, or (None, None) if unreachable."""
+    url = CFG["MOONRAKER_URL"].rstrip("/") + "/printer/objects/query?print_stats"
+    try:
+        raw = http_get(url, timeout=6)
+        ps = json.loads(raw.decode())["result"]["status"]["print_stats"]
+        return ps.get("state"), (ps.get("filename") or None)
+    except Exception:  # noqa: BLE001
+        return None, None
 
 
 def moonraker_pause():
@@ -163,9 +178,12 @@ def poller():
     while True:
         t0 = time.time()
         try:
+            with LOCK:
+                conf_min = STATE["conf"]
             raw_dets = score_via_mlapi()
             score_ms = (time.time() - t0) * 1000.0
             frame = grab_frame_bytes()
+            pstate, pfile = moonraker_print_state()
 
             dets, max_conf = [], 0.0
             for row in raw_dets:
@@ -175,7 +193,7 @@ def poller():
                     box = [float(v) for v in row[2]]
                 except (IndexError, TypeError, ValueError):
                     continue
-                if conf >= CFG["CONF"]:
+                if conf >= conf_min:
                     dets.append({"conf": round(conf, 3), "box": box})
                     max_conf = max(max_conf, conf)
             positive = len(dets) > 0
@@ -190,6 +208,10 @@ def poller():
                 STATE["score_ms"] = round(score_ms, 1)
                 STATE["last_detections"] = dets
                 STATE["max_conf"] = round(max_conf, 3)
+                STATE["printer_ok"] = pstate is not None
+                if pstate is not None:
+                    STATE["printer_state"] = pstate
+                    STATE["printer_file"] = pfile
                 if positive:
                     STATE["pos_streak"] += 1
                     STATE["clean_streak"] = 0
@@ -249,6 +271,7 @@ PAGE = """<!doctype html><html><head><meta charset=utf-8>
  <span class=dot id=dot></span>
  <h1>🍝 Spaghetti Detector — SV08</h1>
  <span id=badge class="badge ok">…</span>
+ <span id=pbadge class="badge" style="margin-left:auto">…</span>
 </header>
 <div class=wrap>
  <div class=cam><img id=cam src="/snapshot.jpg" alt="camera"></div>
@@ -259,6 +282,14 @@ PAGE = """<!doctype html><html><head><meta charset=utf-8>
    <button id=ap onclick=toggleAP()>…</button>
   </div>
   <p class=hint id=aphint></p>
+  <div class=tgl style="display:block">
+   <div style="display:flex;justify-content:space-between">
+    <span class=k>Sensitivity</span>
+    <span class=v><span id=confval>…</span> min conf</span>
+   </div>
+   <input id=conf type=range min=5 max=95 step=1 style="width:100%;margin-top:8px" onchange=setConf(this.value)>
+   <p class=hint>Lower = more sensitive (flags sooner, more false positives). Higher = stricter.</p>
+  </div>
   <p style="margin-top:14px"><a href=/api/status>/api/status</a> · <a href=/healthz>/healthz</a></p>
  </div>
 </div>
@@ -282,6 +313,21 @@ PAGE = """<!doctype html><html><head><meta charset=utf-8>
    paintAP((await r.json()).auto_pause);
   }catch(e){}
  }
+ async function setConf(v){
+  const c=(v/100).toFixed(2);
+  document.getElementById('confval').textContent=c;
+  try{await fetch('/api/sensitivity',{method:'POST',headers:{'Content-Type':'application/json'},
+                                       body:JSON.stringify({conf:parseFloat(c)})});}catch(e){}
+ }
+ const PBADGE={printing:['printing','#1a3d1a','#7ee787'],paused:['paused','#4d3a14','#e3b341'],
+   complete:['complete','#1a3d1a','#7ee787'],cancelled:['cancelled','#30363d','#8b949e'],
+   standby:['idle','#30363d','#8b949e'],error:['error','#4d1414','#ff7b72']};
+ function paintPrinter(s){
+  const b=document.getElementById('pbadge');
+  if(!s.printer_ok){b.textContent='no printer';b.style.background='#4d3a14';b.style.color='#e3b341';return;}
+  const m=PBADGE[s.printer_state]||[s.printer_state||'?','#30363d','#8b949e'];
+  b.textContent=m[0];b.style.background=m[1];b.style.color=m[2];
+ }
  async function refresh(){
   try{
    const s=await (await fetch('/api/status')).json();
@@ -291,14 +337,20 @@ PAGE = """<!doctype html><html><head><meta charset=utf-8>
    b.textContent=a?'ALERT — failure':(s.ml_ok?'OK':'no ml_api');
    b.className='badge '+(a?'alert':'ok');
    const rows=[
+    ['Printer',s.printer_ok?s.printer_state:'unreachable'],
+    ['Print file',s.printer_file||'—'],
     ['ml_api',s.ml_ok?'up':'DOWN'],['Score',s.score_ms+' ms'],
     ['Frames',s.frames],['Pos streak',s.pos_streak],['Clean streak',s.clean_streak],
-    ['Max conf',s.max_conf],['Detections',s.last_detections.length],
+    ['Max conf',s.max_conf],['Min conf',s.conf],['Detections',s.last_detections.length],
     ['Paused print',s.paused_print?'YES':'no'],
     ['Last grab',s.last_grab||'—'],['Last error',s.last_error||'none'],['Started',s.started],
    ];
    document.getElementById('stats').innerHTML=rows.map(r=>`<tr><td class=k>${r[0]}</td><td class=v>${r[1]}</td></tr>`).join('');
    paintAP(s.auto_pause);
+   paintPrinter(s);
+   const cs=document.getElementById('conf');
+   if(document.activeElement!==cs){cs.value=Math.round(s.conf*100);
+    document.getElementById('confval').textContent=Number(s.conf).toFixed(2);}
   }catch(e){}
  }
  setInterval(refreshCam,4000);setInterval(refresh,2000);refresh();
@@ -335,26 +387,40 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, "text/plain", b"not found")
 
+    def _read_json(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > 1024:
+            raise ValueError("body too large")
+        return json.loads(self.rfile.read(n).decode() or "{}")
+
     def do_POST(self):
         p = urllib.parse.urlparse(self.path).path
-        if p != "/api/auto_pause":
+        if p == "/api/auto_pause":
+            try:
+                enabled = self._read_json()["enabled"]
+                if not isinstance(enabled, bool):
+                    raise ValueError("'enabled' must be a boolean")
+            except (ValueError, KeyError, UnicodeDecodeError) as e:
+                self._send(400, "application/json", json.dumps({"error": str(e)}).encode())
+                return
+            with LOCK:
+                STATE["auto_pause"] = enabled
+            log(f"auto-pause toggled {'ON' if enabled else 'OFF'} via API")
+            self._send(200, "application/json", json.dumps({"auto_pause": enabled}).encode())
+        elif p == "/api/sensitivity":
+            try:
+                val = float(self._read_json()["conf"])
+                if not 0.05 <= val <= 0.95:
+                    raise ValueError("'conf' must be between 0.05 and 0.95")
+            except (ValueError, KeyError, TypeError, UnicodeDecodeError) as e:
+                self._send(400, "application/json", json.dumps({"error": str(e)}).encode())
+                return
+            with LOCK:
+                STATE["conf"] = round(val, 2)
+            log(f"sensitivity set: min conf={val:.2f} via API")
+            self._send(200, "application/json", json.dumps({"conf": round(val, 2)}).encode())
+        else:
             self._send(404, "text/plain", b"not found")
-            return
-        try:
-            n = int(self.headers.get("Content-Length") or 0)
-            if n > 1024:
-                raise ValueError("body too large")
-            req = json.loads(self.rfile.read(n).decode() or "{}")
-            enabled = req["enabled"]
-            if not isinstance(enabled, bool):
-                raise ValueError("'enabled' must be a boolean")
-        except (ValueError, KeyError, UnicodeDecodeError) as e:
-            self._send(400, "application/json", json.dumps({"error": str(e)}).encode())
-            return
-        with LOCK:
-            STATE["auto_pause"] = enabled
-        log(f"auto-pause toggled {'ON' if enabled else 'OFF'} via API")
-        self._send(200, "application/json", json.dumps({"auto_pause": enabled}).encode())
 
 
 def main():
