@@ -1,5 +1,7 @@
 # 🍝 SpaghettiGuard
 
+> Self-hosted, no-cloud, free 3D-print spaghetti/failure detector — Obico ml_api (CPU) + webcam poller + live dashboard. Notify-only or optional Moonraker auto-pause.
+
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 ![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue)
 ![Docker required](https://img.shields.io/badge/docker-required-2496ED?logo=docker&logoColor=white)
