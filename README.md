@@ -1,5 +1,8 @@
 # 🍝 SpaghettiGuard
 
+> **⚠️ WORK IN PROGRESS — NOT PRODUCTION READY ⚠️**
+> Bed-clear calibration (Z/time-slot reference build) is under active development.
+
 > Self-hosted, no-cloud, free 3D-print spaghetti/failure detector — Obico ml_api (CPU) + webcam poller + live dashboard. Notify-only or optional Moonraker auto-pause.
 
 <p align="center">
