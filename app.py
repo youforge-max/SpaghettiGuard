@@ -12,8 +12,10 @@ AUTO_PAUSE=0 for notify-only. It is also toggleable live from the dashboard
 """
 import io
 import os
+import sys
 import json
 import time
+import subprocess
 import threading
 import datetime as dt
 import urllib.request
@@ -63,54 +65,77 @@ def load_bed_reference():
         return None
 
 
-class BedRefStack:
-    """Z-indexed clear-bed reference stack (bed_ref_z/zNNN.png, X/Y locked).
+def _hour_cyclic_dist(a, b):
+    d = abs(a - b) % 24
+    return min(d, 24 - d)
 
-    The grazing cam sees the nozzle at a different apparent height per Z, so a
-    single reference is only valid at one Z. Post-print the head sits at a fixed
-    X/Y but a varying Z; pick the reference nearest the current Z so the nozzle
-    cancels in the diff. Falls back to the single bed_reference.png if no stack.
+
+class BedRefStack:
+    """Clear-bed reference stack indexed by (hour-of-day, Z), X/Y locked.
+
+    Two things move the empty-bed image: (1) Z — the grazing cam sees the nozzle
+    at a different apparent height per Z; (2) time of day — the printer is by a
+    window, so daylight shifts the *shadows*, not just brightness (exposure-
+    normalise only cancels global brightness). So references live in per-hour
+    dirs bed_ref_z/hHH/zNNN.png. Each frame we pick the reference nearest the
+    current toolhead Z within the hour-dir nearest the current wall-clock hour
+    (cyclic). Falls back to a single legacy bed_reference.png if no stack.
     """
 
     def __init__(self):
-        self.zs = []
-        self.cache = {}
+        self.hours = {}          # hour_int -> sorted [z_int, ...]
+        self.cache = {}          # (hour_int, z_int) -> ref_small
         self.single = None
         try:
-            for fn in os.listdir(BED_REF_Z_DIR):
-                if fn.startswith("z") and fn.endswith(".png"):
-                    try:
-                        self.zs.append(int(fn[1:-4]))
-                    except ValueError:
-                        pass
-            self.zs.sort()
+            for tag in os.listdir(BED_REF_Z_DIR):
+                d = os.path.join(BED_REF_Z_DIR, tag)
+                if not (tag.startswith("h") and os.path.isdir(d)):
+                    continue
+                try:
+                    hh = int(tag[1:])
+                except ValueError:
+                    continue
+                zs = []
+                for fn in os.listdir(d):
+                    if fn.startswith("z") and fn.endswith(".png"):
+                        try:
+                            zs.append(int(fn[1:-4]))
+                        except ValueError:
+                            pass
+                if zs:
+                    self.hours[hh] = sorted(zs)
         except FileNotFoundError:
             pass
-        if not self.zs:
+        if not self.hours:
             self.single = load_bed_reference()
-            log("bed: no Z-stack; using single bed_reference.png")
+            log("bed: no Z/hour-stack; using single bed_reference.png")
         else:
-            log(f"bed: Z-stack loaded {len(self.zs)} refs "
-                f"(z{self.zs[0]}..z{self.zs[-1]})")
+            tot = sum(len(v) for v in self.hours.values())
+            log(f"bed: stack loaded {tot} refs across {len(self.hours)} hours "
+                f"{sorted(self.hours)}")
 
     def ready(self):
-        return bool(self.zs) or self.single is not None
+        return bool(self.hours) or self.single is not None
 
-    def get(self, z):
-        """Return (ref_small, chosen_z) nearest z, or (single, None)."""
-        if not self.zs:
-            return self.single, None
-        if z is None:
-            z = self.zs[len(self.zs) // 2]
-        nz = min(self.zs, key=lambda a: abs(a - z))
-        if nz not in self.cache:
+    def get(self, z, hour):
+        """Return (ref_small, chosen_z, chosen_hour); (single, None, None) if flat."""
+        if not self.hours:
+            return self.single, None, None
+        if hour is None:
+            hour = 12
+        nh = min(self.hours, key=lambda h: (_hour_cyclic_dist(h, hour), h))
+        zs = self.hours[nh]
+        zref = zs[len(zs) // 2] if z is None else min(zs, key=lambda a: abs(a - z))
+        key = (nh, zref)
+        if key not in self.cache:
             try:
-                self.cache[nz] = bed_roi_gray(
-                    Image.open(os.path.join(BED_REF_Z_DIR, f"z{nz:03d}.png")).convert("RGB"))
+                self.cache[key] = bed_roi_gray(Image.open(
+                    os.path.join(BED_REF_Z_DIR, f"h{nh:02d}", f"z{zref:03d}.png")
+                ).convert("RGB"))
             except Exception as e:  # noqa: BLE001
-                log(f"bed: failed loading z{nz:03d}.png: {e}")
-                return self.single, None
-        return self.cache[nz], nz
+                log(f"bed: failed loading h{nh:02d}/z{zref:03d}.png: {e}")
+                return self.single, None, None
+        return self.cache[key], zref, nh
 
 
 def bed_detect(frame_img, ref_small):
@@ -183,6 +208,9 @@ STATE = {
     "bed_occupied": False,             # True = object detected on the bed
     "bed_changed": 0.0,                # fraction of bed blocks changed vs reference
     "bed_ref_z": None,                 # Z (mm) of the reference chosen this frame (Z-stack)
+    "bed_ref_hour": None,              # hour-of-day bucket of the reference chosen this frame
+    "bed_calibrating": False,          # True while a Z-stack sweep is running
+    "bed_calib_msg": "",               # last calibration result/status line
 }
 LATEST_JPG = None
 
@@ -232,6 +260,35 @@ def moonraker_z():
         return float(json.loads(raw.decode())["result"]["status"]["toolhead"]["position"][2])
     except Exception:  # noqa: BLE001
         return None
+
+
+def run_calibration():
+    """Run a full Z-stack sweep for the current hour (blocking; call in a thread).
+
+    Moves the head (Z only, X/Y locked) capturing empty-bed references into
+    bed_ref_z/hHH/. Head motion is the caller's responsibility to authorise; the
+    sweep script itself refuses if a print is running. The live BedRefStack picks
+    up the new dir at its next 15-min reload.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    with LOCK:
+        STATE["bed_calibrating"] = True
+        STATE["bed_calib_msg"] = f"sweeping Z since {dt.datetime.now():%H:%M:%S}..."
+    try:
+        r = subprocess.run([sys.executable, os.path.join(here, "capture_z_stack.py")],
+                           capture_output=True, text=True, timeout=1800, cwd=here)
+        last = (r.stdout or "").strip().splitlines()
+        tail = last[-1] if last else ""
+        if r.returncode == 0:
+            msg = f"done {dt.datetime.now():%H:%M}: {tail}"
+        else:
+            msg = f"failed rc={r.returncode}: {((r.stderr or tail) or '')[:180]}"
+    except Exception as e:  # noqa: BLE001
+        msg = f"error: {e}"
+    log(f"calibrate: {msg}")
+    with LOCK:
+        STATE["bed_calibrating"] = False
+        STATE["bed_calib_msg"] = msg
 
 
 def moonraker_pause():
@@ -306,8 +363,12 @@ def poller():
     global LATEST_JPG
     log(f"ml_api target {CFG['ML_API_URL']}  webcam {CFG['SNAPSHOT_URL']}")
     bed_stack = BedRefStack()
+    bed_stack_loaded = time.time()
     while True:
         t0 = time.time()
+        if t0 - bed_stack_loaded > 900:   # reload every 15min: pick up new hourly dirs
+            bed_stack = BedRefStack()
+            bed_stack_loaded = t0
         try:
             with LOCK:
                 conf_min = STATE["conf"]
@@ -317,11 +378,11 @@ def poller():
             pstate, pfile = moonraker_print_state()
 
             # bed-clear check (independent of the spaghetti model)
-            bed_occupied, bed_changed, bed_box, bed_ref_z = False, 0.0, None, None
+            bed_occupied, bed_changed, bed_box, bed_ref_z, bed_ref_h = False, 0.0, None, None, None
             if bed_stack.ready():
                 try:
                     cur_z = moonraker_z()
-                    bed_ref, bed_ref_z = bed_stack.get(cur_z)
+                    bed_ref, bed_ref_z, bed_ref_h = bed_stack.get(cur_z, dt.datetime.now().hour)
                     if bed_ref is not None:
                         bed_occupied, bed_changed, bed_box = bed_detect(
                             Image.open(io.BytesIO(frame)).convert("RGB"), bed_ref)
@@ -359,6 +420,7 @@ def poller():
                 STATE["bed_occupied"] = bed_occupied
                 STATE["bed_changed"] = round(bed_changed, 4)
                 STATE["bed_ref_z"] = bed_ref_z
+                STATE["bed_ref_hour"] = bed_ref_h
                 if positive:
                     STATE["pos_streak"] += 1
                     STATE["clean_streak"] = 0
@@ -438,6 +500,11 @@ PAGE = """<!doctype html><html><head><meta charset=utf-8>
    <input id=conf type=range min=5 max=95 step=1 style="width:100%;margin-top:8px" onchange=setConf(this.value)>
    <p class=hint>Lower = more sensitive (flags sooner, more false positives). Higher = stricter.</p>
   </div>
+  <div style="margin-top:14px">
+   <button id=calibbtn onclick=calibrate()
+     style="width:100%;padding:9px;background:#0d3b3a;color:#39c5bb;border:1px solid #39c5bb;border-radius:6px;cursor:pointer;font:inherit">Calibrate empty bed (Z sweep)</button>
+   <p class=hint id=calibhint>Captures clear-bed references for the current hour. Moves the head (Z only, X/Y locked). Bed must be EMPTY.</p>
+  </div>
   <p style="margin-top:14px"><a href=/api/status>/api/status</a> · <a href=/healthz>/healthz</a></p>
  </div>
 </div>
@@ -482,6 +549,21 @@ PAGE = """<!doctype html><html><head><meta charset=utf-8>
   if(s.bed_occupied){b.textContent='bed: OBJECT';b.style.background='#0d3b3a';b.style.color='#39c5bb';}
   else{b.textContent='bed: clear';b.style.background='#1a3d1a';b.style.color='#7ee787';}
  }
+ async function calibrate(){
+  if(!confirm('Start empty-bed calibration now?\nThe head WILL move (Z sweep to Z max, several minutes). The bed must be EMPTY.'))return;
+  try{
+   const r=await fetch('/api/calibrate',{method:'POST'});
+   const j=await r.json();
+   if(!r.ok){alert('Cannot calibrate: '+(j.error||r.status));return;}
+  }catch(e){alert('calibrate failed: '+e);}
+ }
+ function paintCalib(s){
+  const b=document.getElementById('calibbtn'),h=document.getElementById('calibhint');
+  b.disabled=!!s.bed_calibrating;
+  b.textContent=s.bed_calibrating?'Calibrating… (head moving)':'Calibrate empty bed (Z sweep)';
+  b.style.opacity=s.bed_calibrating?'0.6':'1';
+  if(s.bed_calib_msg)h.textContent=s.bed_calib_msg;
+ }
  async function refresh(){
   try{
    const s=await (await fetch('/api/status')).json();
@@ -492,6 +574,7 @@ PAGE = """<!doctype html><html><head><meta charset=utf-8>
    b.className='badge '+(a?'alert':'ok');
    const rows=[
     ['Bed',!s.bed_ok?'no reference':(s.bed_occupied?'OBJECT ('+(s.bed_changed*100).toFixed(1)+'%)':'clear')],
+    ['Bed ref',s.bed_ref_z!=null?('z'+s.bed_ref_z+' / h'+s.bed_ref_hour):'—'],
     ['Printer',s.printer_ok?s.printer_state:'unreachable'],
     ['Print file',s.printer_file||'—'],
     ['ml_api',s.ml_ok?'up':'DOWN'],['Score',s.score_ms+' ms'],
@@ -504,6 +587,7 @@ PAGE = """<!doctype html><html><head><meta charset=utf-8>
    paintAP(s.auto_pause);
    paintPrinter(s);
    paintBed(s);
+   paintCalib(s);
    const cs=document.getElementById('conf');
    if(document.activeElement!==cs){cs.value=Math.round(s.conf*100);
     document.getElementById('confval').textContent=Number(s.conf).toFixed(2);}
@@ -575,6 +659,21 @@ class Handler(BaseHTTPRequestHandler):
                 STATE["conf"] = round(val, 2)
             log(f"sensitivity set: min conf={val:.2f} via API")
             self._send(200, "application/json", json.dumps({"conf": round(val, 2)}).encode())
+        elif p == "/api/calibrate":
+            pstate, _ = moonraker_print_state()
+            if pstate == "printing":
+                self._send(409, "application/json",
+                           json.dumps({"error": "print running"}).encode())
+                return
+            with LOCK:
+                busy = STATE["bed_calibrating"]
+            if busy:
+                self._send(409, "application/json",
+                           json.dumps({"error": "already calibrating"}).encode())
+                return
+            threading.Thread(target=run_calibration, daemon=True).start()
+            log("calibrate: started via API (head will move, Z sweep)")
+            self._send(200, "application/json", json.dumps({"started": True}).encode())
         else:
             self._send(404, "text/plain", b"not found")
 

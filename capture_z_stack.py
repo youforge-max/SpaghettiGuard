@@ -6,6 +6,7 @@ reference is wrong for a grazing cam (nozzle sits at a different apparent height
 per Z). This builds a Z-indexed reference stack of the EMPTY bed once, so a later
 check can pick the reference matching the current Z. Bed MUST be empty when run.
 """
+import datetime as dt
 import io
 import json
 import sys
@@ -18,7 +19,12 @@ from PIL import Image
 
 MOONRAKER = "http://192.168.0.72"
 SNAPSHOT_URL = f"{MOONRAKER}/webcam/?action=snapshot"
-OUTDIR = Path(__file__).resolve().parent / "bed_ref_z"
+# Per-hour reference dirs (lighting shifts over the day: window sun moves the
+# shadows, not just brightness). Default = current hour bucket bed_ref_z/hHH/.
+# Override with argv[1] (an hour tag like "h07") for testing.
+_ROOT = Path(__file__).resolve().parent / "bed_ref_z"
+_TAG = sys.argv[1] if len(sys.argv) > 1 else f"h{dt.datetime.now():%H}"
+OUTDIR = _ROOT / _TAG
 
 PARK_X, PARK_Y = 5.0, 345.0     # locked X/Y (current print-end-style pose)
 Z_START, Z_END, Z_STEP = 5, 304, 1   # Z305 hits enclosure top (measured 2026-07-15); 304 = safe ceiling
