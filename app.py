@@ -545,8 +545,8 @@ PAGE = """<!doctype html><html><head><meta charset=utf-8>
   </div>
   <div style="margin-top:14px">
    <button id=calibbtn onclick=calibrate()
-     style="width:100%;padding:9px;background:#0d3b3a;color:#39c5bb;border:1px solid #39c5bb;border-radius:6px;cursor:pointer;font:inherit">Calibrate empty bed (Z sweep)</button>
-   <p class=hint id=calibhint>Captures clear-bed references for the current hour. Moves the head (Z only, X/Y locked). Bed must be EMPTY.</p>
+     style="width:100%;padding:9px;background:#0d3b3a;color:#39c5bb;border:1px solid #39c5bb;border-radius:6px;cursor:pointer;font:inherit">Start 24h bed calibration</button>
+   <p class=hint id=calibhint>Builds clear-bed references every 15 min for 24h (homes, parks back-left, Z sweep). Head MOVES. Bed must be EMPTY and stay empty.</p>
   </div>
   <p style="margin-top:14px"><a href=/api/status>/api/status</a> · <a href=/healthz>/healthz</a></p>
  </div>
@@ -593,7 +593,7 @@ PAGE = """<!doctype html><html><head><meta charset=utf-8>
   else{b.textContent='bed: clear';b.style.background='#1a3d1a';b.style.color='#7ee787';}
  }
  async function calibrate(){
-  if(!confirm('Start the 24h empty-bed calibration build now?\nA full Z sweep runs immediately and then every 15 min for 24h (96 slots), so references track daylight. The head WILL move (Z sweep, several min each). The bed must be EMPTY and stay empty. Auto-stops when all 96 slots are captured.'))return;
+  if(!confirm('Start the 24h empty-bed calibration build now?\\nA full Z sweep runs immediately and then every 15 min for 24h (96 slots), so references track daylight. The head WILL move (Z sweep, several min each). The bed must be EMPTY and stay empty. Auto-stops when all 96 slots are captured.'))return;
   try{
    const r=await fetch('/api/calibrate',{method:'POST'});
    const j=await r.json();
