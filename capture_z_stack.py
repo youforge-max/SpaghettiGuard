@@ -7,8 +7,10 @@ per Z). This builds a Z-indexed reference stack of the EMPTY bed once, so a late
 check can pick the reference matching the current Z. Bed MUST be empty when run.
 """
 import datetime as dt
+import fcntl
 import io
 import json
+import os
 import sys
 import time
 import urllib.parse
@@ -16,6 +18,23 @@ import urllib.request
 from pathlib import Path
 
 from PIL import Image
+
+# Single-instance lock: the dashboard button and the */15 cron can both fire a
+# sweep; two sweeps commanding Z at once make the head oscillate wildly. Hold an
+# exclusive flock for the whole run; a second instance exits immediately.
+_LOCK_PATH = Path("/tmp/spaghetti_bed_sweep.lock")
+_lock_fh = None
+
+
+def acquire_lock():
+    global _lock_fh
+    _lock_fh = open(_LOCK_PATH, "w")
+    try:
+        fcntl.flock(_lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit("refusing: another bed sweep is already running (lock held)")
+    _lock_fh.write(f"{os.getpid()} {dt.datetime.now():%F %T}\n")
+    _lock_fh.flush()
 
 MOONRAKER = "http://192.168.0.72"
 SNAPSHOT_URL = f"{MOONRAKER}/webcam/?action=snapshot"
@@ -89,6 +108,7 @@ def set_fans(speeds):
 
 
 def main():
+    acquire_lock()
     st, _ = state_pos()
     if st == "printing":
         sys.exit("refusing: print running")
