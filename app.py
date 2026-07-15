@@ -591,7 +591,7 @@ PAGE = """<!doctype html><html><head><meta charset=utf-8>
    <button id=calibbtn onclick=calibrate()
      style="width:100%;padding:9px;background:#0d3b3a;color:#39c5bb;border:1px solid #39c5bb;border-radius:6px;cursor:pointer;font:inherit">Capture bed reference</button>
    <button id=calibabort onclick=abortCalib() disabled
-     style="width:100%;margin-top:6px;padding:9px;background:#3b0d0d;color:#ff7b72;border:1px solid #ff7b72;border-radius:6px;cursor:pointer;font:inherit;display:none">Abort sweep</button>
+     style="width:100%;margin-top:6px;padding:9px;background:#3b0d0d;color:#ff7b72;border:1px solid #ff7b72;border-radius:6px;cursor:pointer;font:inherit">Abort sweep</button>
    <p class=hint id=calibhint>One Z sweep of the current time slot (homes, parks back-left, Z 5→300). Head MOVES only while running — no schedule. Bed must be EMPTY. Press again anytime to add slots.</p>
   </div>
   <p style="margin-top:14px"><a href=/api/status>/api/status</a> · <a href=/healthz>/healthz</a></p>
@@ -661,8 +661,8 @@ PAGE = """<!doctype html><html><head><meta charset=utf-8>
   b.disabled=!!s.bed_calibrating;
   b.textContent=s.bed_calibrating?'Calibrating… (head moving)':'Capture bed reference';
   b.style.opacity=s.bed_calibrating?'0.6':'1';
-  a.style.display=s.bed_calibrating?'block':'none';
-  a.disabled=!s.bed_calibrating||!!s.bed_calib_aborting;
+  a.disabled=!s.bed_calibrating||!!s.bed_calib_aborting;   // always visible; greyed when idle
+  a.style.opacity=(!s.bed_calibrating||!!s.bed_calib_aborting)?'0.5':'1';
   if(!s.bed_calib_aborting)a.textContent='Abort sweep';
   if(s.bed_calib_msg)h.textContent=s.bed_calib_msg;
  }
