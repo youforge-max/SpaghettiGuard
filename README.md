@@ -69,6 +69,16 @@ the camera, debounces detections into stable alerts, and gives you a dashboard a
 - **Docker** (to run the inference container).
 - **Python 3.8+** (to run the app; only dependency is Pillow).
 
+> **Where to run it:** the app itself is tiny (Pillow + stdlib), but the Obico
+> `ml_api` inference container is CPU- and RAM-hungry (≈1 GB image, hundreds of MB
+> resident, ONNX scoring every few seconds). Run SpaghettiGuard on a **separate
+> always-on machine**, not on the printer's own SBC (e.g. a 1 GB Pi/CB1 already
+> running Klipper). On such a host the inference would contend with Klipper's
+> realtime loop — risking print stutter — and can exhaust RAM. Point `SNAPSHOT_URL`
+> and `MOONRAKER_URL` at the printer over the LAN instead. Only the lightweight
+> **bed-clear** check (Pillow-only, no ml_api) is cheap enough to co-locate on the
+> printer host if you ever split the two.
+
 ## Install
 
 ```bash
