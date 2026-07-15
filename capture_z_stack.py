@@ -27,7 +27,7 @@ _TAG = sys.argv[1] if len(sys.argv) > 1 else f"h{dt.datetime.now():%H}"
 OUTDIR = _ROOT / _TAG
 
 PARK_X, PARK_Y = 5.0, 345.0     # locked X/Y (current print-end-style pose)
-Z_START, Z_END, Z_STEP = 5, 304, 1   # Z305 hits enclosure top (measured 2026-07-15); 304 = safe ceiling
+Z_START, Z_END, Z_STEP = 5, 300, 1   # Z305 hits enclosure top (measured 2026-07-15); capped 300 per user
 
 
 def post(path, timeout=90):
