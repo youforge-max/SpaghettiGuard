@@ -223,6 +223,25 @@ if one is running).
 Bias is intentionally toward **false positives**: a spurious "object" is cheap, a
 toolhead crashing into a missed part is not.
 
+### Standalone / scheduled check (`bed_check.py`)
+
+Besides the live dashboard, bed-clear detection also works as a one-shot CLI —
+handy for a scheduled crash-guard between jobs:
+
+```bash
+python3 bed_check.py --capture-reference   # run once, bed actually empty
+python3 bed_check.py --check               # prints CLEAR / OCCUPIED + match%
+python3 bed_check.py --check --no-park      # skip the park (head already positioned)
+```
+
+Exit code: `0` = clear, `2` = occupied, `1` = error / no reference. Each `--check`
+parks the head to the reference pose first and **refuses to run while a print is
+active**, so it's safe to schedule. To poll periodically (e.g. an hourly bed-clear
+sweep over a day) wrap it in a loop or a cron/systemd-timer entry that runs
+`bed_check.py --check` on your interval and logs the verdict — the exit code drives
+any alerting you bolt on. Keep the head parked at the same pose the reference was
+captured at, or the toolhead itself reads as a false "occupied".
+
 > Still under active development — thresholds and the reference set are being tuned.
 
 ## What it is not
