@@ -54,7 +54,9 @@ _TAG = sys.argv[1] if len(sys.argv) > 1 else _slot_tag()
 OUTDIR = _ROOT / _TAG
 
 PARK_X, PARK_Y = 5.0, 345.0     # locked X/Y (current print-end-style pose)
+Z_HARD_MAX = 300                     # ABSOLUTE ceiling — head must NEVER exceed (enclosure)
 Z_START, Z_END, Z_STEP = 5, 300, 1   # Z305 hits enclosure top (measured 2026-07-15); capped 300 per user
+Z_END = min(Z_END, Z_HARD_MAX)       # belt-and-braces: clamp even if Z_END edited too high
 
 
 def post(path, timeout=90):
@@ -123,6 +125,9 @@ def main():
         gcode("G28\nM400")
         gcode(f"G90\nG1 X{PARK_X} Y{PARK_Y} F6000\nM400")
         for z in range(Z_START, Z_END + 1, Z_STEP):
+            if z > Z_HARD_MAX:           # hard stop: never command above the ceiling
+                print(f"STOP: z {z} > Z_HARD_MAX {Z_HARD_MAX}", flush=True)
+                break
             gcode(f"G1 Z{z} F900\nM400")
             # confirm Z landed
             for _ in range(20):
