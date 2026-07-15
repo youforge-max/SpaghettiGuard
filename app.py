@@ -20,12 +20,71 @@ import urllib.request
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageChops, ImageStat
 
 
 def env(k, d=None):
     v = os.environ.get(k)
     return v if v not in (None, "") else d
+
+
+# --- Bed-clear detection (reference-diff, PIL-only, no numpy) ------------------
+# Separate from the Obico spaghetti model: that finds tangled-filament failures,
+# this answers "is a solid object on the bed" by diffing against a stored clear-bed
+# reference. Only valid while the toolhead sits where the reference was captured
+# (the head must not move between reference and check) — same nozzle position
+# cancels in the diff. Camera is low/grazing: objects behind the toolhead or
+# very flat can hide (see bed_check.py CAMERA CAVEAT).
+BED_REF_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bed_reference.png")
+BED_ROI = (0.00, 0.22, 1.00, 0.86)   # frac left,top,right,bottom of the frame
+BED_DOWNSAMPLE = (128, 72)
+BED_BLUR = 3
+BED_PIXEL_DELTA = 32                  # per-pixel grayscale abs-diff = "changed"
+BED_CHANGE_THRESHOLD = 0.02           # occupied if > this fraction of blocks changed
+
+
+def bed_roi_gray(img):
+    """Crop to BED_ROI, grayscale, blur, downsample — the comparison form."""
+    w, h = img.size
+    l, t, r, b = BED_ROI
+    crop = img.crop((int(l * w), int(t * h), int(r * w), int(b * h)))
+    crop = crop.convert("L").filter(ImageFilter.GaussianBlur(BED_BLUR))
+    return crop.resize(BED_DOWNSAMPLE)
+
+
+def load_bed_reference():
+    try:
+        return bed_roi_gray(Image.open(BED_REF_PATH).convert("RGB"))
+    except Exception as e:  # noqa: BLE001
+        log(f"bed: no reference ({e}); bed-clear disabled until --capture-reference")
+        return None
+
+
+def bed_detect(frame_img, ref_small):
+    """Diff frame vs clear reference. Return (occupied, changed_frac, box_or_None).
+    box is [x0,y0,x1,y1] in full-frame pixel coords."""
+    cur = bed_roi_gray(frame_img)
+    # cancel auto-exposure drift: shift cur so its mean matches the reference
+    delta = int(round(ImageStat.Stat(ref_small).mean[0] - ImageStat.Stat(cur).mean[0]))
+    if delta:
+        cur = cur.point(lambda v, d=delta: max(0, min(255, v + d)))
+    diff = ImageChops.difference(ref_small, cur)
+    mask = diff.point(lambda v: 255 if v > BED_PIXEL_DELTA else 0)
+    total = BED_DOWNSAMPLE[0] * BED_DOWNSAMPLE[1]
+    changed = mask.histogram()[255] / total
+    occupied = changed > BED_CHANGE_THRESHOLD
+    box = None
+    if occupied:
+        bb = mask.getbbox()  # in downsample coords
+        if bb:
+            fw, fh = frame_img.size
+            l, t, r, b = BED_ROI
+            rx = (r - l) * fw / BED_DOWNSAMPLE[0]
+            ry = (b - t) * fh / BED_DOWNSAMPLE[1]
+            ox, oy = l * fw, t * fh
+            box = [ox + bb[0] * rx, oy + bb[1] * ry,
+                   ox + bb[2] * rx, oy + bb[3] * ry]
+    return occupied, changed, box
 
 
 CFG = {
@@ -67,6 +126,9 @@ STATE = {
     "printer_state": "?",              # from Moonraker print_stats: printing/paused/complete/standby/...
     "printer_file": None,
     "printer_ok": False,               # False = Moonraker unreachable
+    "bed_ok": False,                   # False = no clear-bed reference loaded
+    "bed_occupied": False,             # True = object detected on the bed
+    "bed_changed": 0.0,                # fraction of bed blocks changed vs reference
 }
 LATEST_JPG = None
 
@@ -152,8 +214,8 @@ def on_alert(max_conf):
             STATE["paused_print"] = True
 
 
-def annotate(frame_bytes, dets, alert, streak):
-    """Draw failure boxes on the frame; return jpeg bytes."""
+def annotate(frame_bytes, dets, alert, streak, bed_box=None):
+    """Draw failure boxes (+ optional bed-object box) on the frame; return jpeg bytes."""
     img = Image.open(io.BytesIO(frame_bytes)).convert("RGB")
     d = ImageDraw.Draw(img)
     box_col = (248, 81, 73) if alert else (210, 153, 34)
@@ -163,6 +225,10 @@ def annotate(frame_bytes, dets, alert, streak):
         x0, y0, x1, y1 = cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2
         d.rectangle([x0, y0, x1, y1], outline=box_col, width=3)
         d.text((x0 + 2, max(0, y0 - 12)), f"failure {conf:.2f}", fill=box_col)
+    if bed_box:                       # cyan = "object on bed" (distinct from failure red/amber)
+        x0, y0, x1, y1 = bed_box
+        d.rectangle([x0, y0, x1, y1], outline=(57, 197, 187), width=3)
+        d.text((x0 + 2, max(0, y0 - 12)), "bed object", fill=(57, 197, 187))
     # HUD banner
     d.rectangle([0, 0, img.width, 22], fill=(20, 22, 28))
     hud = f"{'ALERT' if alert else 'OK'}  streak={streak}  {dt.datetime.now().strftime('%H:%M:%S')}"
@@ -175,6 +241,7 @@ def annotate(frame_bytes, dets, alert, streak):
 def poller():
     global LATEST_JPG
     log(f"ml_api target {CFG['ML_API_URL']}  webcam {CFG['SNAPSHOT_URL']}")
+    bed_ref = load_bed_reference()
     while True:
         t0 = time.time()
         try:
@@ -184,6 +251,15 @@ def poller():
             score_ms = (time.time() - t0) * 1000.0
             frame = grab_frame_bytes()
             pstate, pfile = moonraker_print_state()
+
+            # bed-clear check (independent of the spaghetti model)
+            bed_occupied, bed_changed, bed_box = False, 0.0, None
+            if bed_ref is not None:
+                try:
+                    bed_occupied, bed_changed, bed_box = bed_detect(
+                        Image.open(io.BytesIO(frame)).convert("RGB"), bed_ref)
+                except Exception as e:  # noqa: BLE001
+                    log(f"bed: detect failed: {e}")
 
             dets, max_conf = [], 0.0
             for row in raw_dets:
@@ -212,6 +288,9 @@ def poller():
                 if pstate is not None:
                     STATE["printer_state"] = pstate
                     STATE["printer_file"] = pfile
+                STATE["bed_ok"] = bed_ref is not None
+                STATE["bed_occupied"] = bed_occupied
+                STATE["bed_changed"] = round(bed_changed, 4)
                 if positive:
                     STATE["pos_streak"] += 1
                     STATE["clean_streak"] = 0
@@ -227,8 +306,8 @@ def poller():
                     STATE["alert_since"] = None
                     log("alert cleared (frames went clean)")
                 alert_now, streak_now = STATE["alert"], STATE["pos_streak"]
-            # redraw banner with final alert state
-            LATEST_JPG = annotate(frame, dets, alert_now, streak_now)
+            # redraw banner with final alert state (+ bed-object box)
+            LATEST_JPG = annotate(frame, dets, alert_now, streak_now, bed_box)
             if fire:
                 on_alert(max_conf)
         except Exception as e:  # noqa: BLE001
@@ -271,7 +350,8 @@ PAGE = """<!doctype html><html><head><meta charset=utf-8>
  <span class=dot id=dot></span>
  <h1>🍝 Spaghetti Detector — SV08</h1>
  <span id=badge class="badge ok">…</span>
- <span id=pbadge class="badge" style="margin-left:auto">…</span>
+ <span id=bedbadge class="badge" style="margin-left:auto">…</span>
+ <span id=pbadge class="badge">…</span>
 </header>
 <div class=wrap>
  <div class=cam><img id=cam src="/snapshot.jpg" alt="camera"></div>
@@ -328,6 +408,12 @@ PAGE = """<!doctype html><html><head><meta charset=utf-8>
   const m=PBADGE[s.printer_state]||[s.printer_state||'?','#30363d','#8b949e'];
   b.textContent=m[0];b.style.background=m[1];b.style.color=m[2];
  }
+ function paintBed(s){
+  const b=document.getElementById('bedbadge');
+  if(!s.bed_ok){b.textContent='bed: no ref';b.style.background='#30363d';b.style.color='#8b949e';return;}
+  if(s.bed_occupied){b.textContent='bed: OBJECT';b.style.background='#0d3b3a';b.style.color='#39c5bb';}
+  else{b.textContent='bed: clear';b.style.background='#1a3d1a';b.style.color='#7ee787';}
+ }
  async function refresh(){
   try{
    const s=await (await fetch('/api/status')).json();
@@ -337,6 +423,7 @@ PAGE = """<!doctype html><html><head><meta charset=utf-8>
    b.textContent=a?'ALERT — failure':(s.ml_ok?'OK':'no ml_api');
    b.className='badge '+(a?'alert':'ok');
    const rows=[
+    ['Bed',!s.bed_ok?'no reference':(s.bed_occupied?'OBJECT ('+(s.bed_changed*100).toFixed(1)+'%)':'clear')],
     ['Printer',s.printer_ok?s.printer_state:'unreachable'],
     ['Print file',s.printer_file||'—'],
     ['ml_api',s.ml_ok?'up':'DOWN'],['Score',s.score_ms+' ms'],
@@ -348,6 +435,7 @@ PAGE = """<!doctype html><html><head><meta charset=utf-8>
    document.getElementById('stats').innerHTML=rows.map(r=>`<tr><td class=k>${r[0]}</td><td class=v>${r[1]}</td></tr>`).join('');
    paintAP(s.auto_pause);
    paintPrinter(s);
+   paintBed(s);
    const cs=document.getElementById('conf');
    if(document.activeElement!==cs){cs.value=Math.round(s.conf*100);
     document.getElementById('confval').textContent=Number(s.conf).toFixed(2);}

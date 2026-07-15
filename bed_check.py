@@ -44,7 +44,7 @@ REF_PATH = HERE / "bed_reference.png"
 PARK_X, PARK_Y, PARK_Z_MIN = 5.0, 5.0, 15.0
 # Bed region of interest in the snapshot (fractions of W,H): left,top,right,bottom.
 # The visible plate sits in the mid band of this grazing cam; tune per-camera.
-ROI = (0.00, 0.30, 1.00, 0.72)
+ROI = (0.00, 0.22, 1.00, 0.86)
 # Preprocessing (calibrated on this webcam 2026-07-15): Gaussian blur then
 # downsample to DOWNSAMPLE, then exposure-normalise, before per-pixel diff.
 # This crushed the empty-vs-empty noise floor from ~6% (raw pixels) to 0.0%.
