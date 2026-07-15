@@ -15,6 +15,7 @@ import os
 import sys
 import json
 import time
+import signal
 import subprocess
 import threading
 import datetime as dt
@@ -229,6 +230,7 @@ STATE = {
     "bed_ref_z": None,                 # Z (mm) of the reference chosen this frame (Z-stack)
     "bed_ref_slot": None,              # 15-min time slot (0..95) of the reference chosen this frame
     "bed_calibrating": False,          # True while a Z-stack sweep is running
+    "bed_calib_aborting": False,       # True once Abort pressed, until the sweep exits
     "bed_calib_msg": "",               # last calibration result/status line
 }
 LATEST_JPG = None
@@ -281,57 +283,99 @@ def moonraker_z():
         return None
 
 
-CALIB_CRON = "*/15 * * * * /home/openclaw/spaghetti-detector/capture_15min.sh"
-
-
-def install_calib_cron():
-    """(Re)install the 15-min build cron. The build self-removes it once all 96
-    slot-dirs are full (see capture_15min.sh). Idempotent."""
+def purge_calib_cron():
+    """Remove any leftover build cron so the head NEVER sweeps unprompted.
+    Calibration is button-only now — no scheduled sweeps exist. Called at
+    startup and after every manual sweep as a safety net."""
     try:
         cur = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
         lines = [ln for ln in (cur.stdout or "").splitlines()
                  if "capture_15min.sh" not in ln and "capture_hourly.sh" not in ln]
-        lines.append(CALIB_CRON)
-        subprocess.run(["crontab", "-"], input="\n".join(lines) + "\n", text=True, check=True)
-        return True
+        subprocess.run(["crontab", "-"], input="\n".join(lines) + ("\n" if lines else ""),
+                       text=True, check=True)
     except Exception as e:  # noqa: BLE001
-        log(f"calibrate: cron install failed: {e}")
-        return False
+        log(f"calibrate: cron purge failed: {e}")
+
+
+CALIB_PROC = None       # running capture_z_stack.py Popen, or None. Guarded by LOCK.
 
 
 def run_calibration():
-    """Start the 24h build on button press (blocking first sweep; call in a thread).
+    """Run ONE clear-bed Z sweep on button press (blocking; call in a thread).
 
-    Installs the 15-min cron so a full Z-stack sweep runs every 15 min into
-    bed_ref_z/qNN/ until all 96 slots are captured (cron self-removes then). Also
-    runs the first sweep immediately so the user sees motion at press. Moves the
-    head (Z only, X/Y locked); the sweep script refuses if a print is running.
-    The live BedRefStack picks up new slot-dirs at its next reload.
+    Captures a full Z-stack into bed_ref_z/qNN/ for the CURRENT 15-min slot only.
+    No cron, no scheduled sweeps — the head moves solely as a direct result of the
+    press and stops when this sweep ends (or Abort). Z only, X/Y locked; the sweep
+    script refuses if a print is running. Press again (any slot, any time of day)
+    to add references; the live BedRefStack picks up new slot-dirs at next reload.
     """
+    global CALIB_PROC
     here = os.path.dirname(os.path.abspath(__file__))
-    cron_ok = install_calib_cron()
-    with LOCK:
-        STATE["bed_calibrating"] = True
-        STATE["bed_calib_msg"] = (
-            f"24h build started {dt.datetime.now():%H:%M} — sweeping first slot..."
-            if cron_ok else
-            f"cron install FAILED — running one-off sweep {dt.datetime.now():%H:%M}...")
+    purge_calib_cron()  # belt-and-braces: kill any stray scheduled sweep
     try:
-        r = subprocess.run([sys.executable, os.path.join(here, "capture_z_stack.py")],
-                           capture_output=True, text=True, timeout=1800, cwd=here)
-        last = (r.stdout or "").strip().splitlines()
-        tail = last[-1] if last else ""
-        if r.returncode == 0:
-            build = "24h build running (every 15 min)" if cron_ok else "one-off done"
-            msg = f"{build}; first sweep {dt.datetime.now():%H:%M}: {tail}"
-        else:
-            msg = f"failed rc={r.returncode}: {((r.stderr or tail) or '')[:180]}"
+        proc = subprocess.Popen(
+            [sys.executable, os.path.join(here, "capture_z_stack.py")],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=here)
     except Exception as e:  # noqa: BLE001
-        msg = f"error: {e}"
+        with LOCK:
+            STATE["bed_calibrating"] = False
+            STATE["bed_calib_msg"] = f"error: {e}"
+        return
+    with LOCK:
+        CALIB_PROC = proc
+        STATE["bed_calibrating"] = True
+        STATE["bed_calib_msg"] = f"sweep started {dt.datetime.now():%H:%M} — capturing this slot..."
+    aborted = False
+    try:
+        out, err = proc.communicate(timeout=1800)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out, err = proc.communicate()
+        err = (err or "") + " [timeout 1800s — killed]"
+    tail = (out or "").strip().splitlines()
+    tail = tail[-1] if tail else ""
+    with LOCK:
+        aborted = STATE.get("bed_calib_aborting", False)
+        STATE["bed_calib_aborting"] = False
+    if aborted:
+        msg = f"aborted {dt.datetime.now():%H:%M} (head stopped, fans restored)"
+    elif proc.returncode == 0:
+        msg = f"sweep done {dt.datetime.now():%H:%M}: {tail}"
+    else:
+        msg = f"failed rc={proc.returncode}: {((err or tail) or '')[:180]}"
     log(f"calibrate: {msg}")
     with LOCK:
+        CALIB_PROC = None
         STATE["bed_calibrating"] = False
         STATE["bed_calib_msg"] = msg
+
+
+def abort_calibration():
+    """Stop a running sweep. SIGINT (not kill) so capture_z_stack's finally runs:
+    restores fans + releases the flock. Escalates to kill if it ignores SIGINT."""
+    with LOCK:
+        proc = CALIB_PROC
+        if proc is None or proc.poll() is not None:
+            return False
+        STATE["bed_calib_aborting"] = True
+        STATE["bed_calib_msg"] = "aborting — stopping head, restoring fans..."
+    try:
+        proc.send_signal(signal.SIGINT)
+    except Exception as e:  # noqa: BLE001
+        log(f"calibrate: abort signal failed: {e}")
+        return False
+    # give the finally block a few seconds; escalate if the process hangs
+    for _ in range(30):
+        if proc.poll() is not None:
+            break
+        time.sleep(0.2)
+    else:
+        try:
+            proc.kill()
+        except Exception:  # noqa: BLE001
+            pass
+    log("calibrate: abort requested (SIGINT sent)")
+    return True
 
 
 def moonraker_pause():
@@ -545,8 +589,10 @@ PAGE = """<!doctype html><html><head><meta charset=utf-8>
   </div>
   <div style="margin-top:14px">
    <button id=calibbtn onclick=calibrate()
-     style="width:100%;padding:9px;background:#0d3b3a;color:#39c5bb;border:1px solid #39c5bb;border-radius:6px;cursor:pointer;font:inherit">Start 24h bed calibration</button>
-   <p class=hint id=calibhint>Builds clear-bed references every 15 min for 24h (homes, parks back-left, Z sweep). Head MOVES. Bed must be EMPTY and stay empty.</p>
+     style="width:100%;padding:9px;background:#0d3b3a;color:#39c5bb;border:1px solid #39c5bb;border-radius:6px;cursor:pointer;font:inherit">Capture bed reference</button>
+   <button id=calibabort onclick=abortCalib() disabled
+     style="width:100%;margin-top:6px;padding:9px;background:#3b0d0d;color:#ff7b72;border:1px solid #ff7b72;border-radius:6px;cursor:pointer;font:inherit;display:none">Abort sweep</button>
+   <p class=hint id=calibhint>One Z sweep of the current time slot (homes, parks back-left, Z 5→300). Head MOVES only while running — no schedule. Bed must be EMPTY. Press again anytime to add slots.</p>
   </div>
   <p style="margin-top:14px"><a href=/api/status>/api/status</a> · <a href=/healthz>/healthz</a></p>
  </div>
@@ -593,18 +639,31 @@ PAGE = """<!doctype html><html><head><meta charset=utf-8>
   else{b.textContent='bed: clear';b.style.background='#1a3d1a';b.style.color='#7ee787';}
  }
  async function calibrate(){
-  if(!confirm('Start the 24h empty-bed calibration build now?\\nA full Z sweep runs immediately and then every 15 min for 24h (96 slots), so references track daylight. The head WILL move (Z sweep, several min each). The bed must be EMPTY and stay empty. Auto-stops when all 96 slots are captured.'))return;
+  const b=document.getElementById('calibbtn');
+  if(b.disabled)return;                       // already running — ignore repeat press
+  if(!confirm('Capture one empty-bed reference sweep now? The head homes, parks back-left and steps Z 5 to 300 (several min). The bed must be EMPTY. No schedule is created — this runs once.'))return;
+  b.disabled=true; b.style.opacity='0.6'; b.textContent='Starting…';   // lock immediately
   try{
    const r=await fetch('/api/calibrate',{method:'POST'});
    const j=await r.json();
-   if(!r.ok){alert('Cannot calibrate: '+(j.error||r.status));return;}
-  }catch(e){alert('calibrate failed: '+e);}
+   if(!r.ok){alert('Cannot calibrate: '+(j.error||r.status)); b.disabled=false; b.style.opacity='1';}
+  }catch(e){alert('calibrate failed: '+e); b.disabled=false; b.style.opacity='1';}
+ }
+ async function abortCalib(){
+  const a=document.getElementById('calibabort');
+  if(a.disabled)return;
+  a.disabled=true; a.textContent='Aborting…';
+  try{await fetch('/api/calib_abort',{method:'POST'});}catch(e){}
  }
  function paintCalib(s){
-  const b=document.getElementById('calibbtn'),h=document.getElementById('calibhint');
+  const b=document.getElementById('calibbtn'),h=document.getElementById('calibhint'),
+        a=document.getElementById('calibabort');
   b.disabled=!!s.bed_calibrating;
-  b.textContent=s.bed_calibrating?'Calibrating… (head moving)':'Start 24h bed calibration';
+  b.textContent=s.bed_calibrating?'Calibrating… (head moving)':'Capture bed reference';
   b.style.opacity=s.bed_calibrating?'0.6':'1';
+  a.style.display=s.bed_calibrating?'block':'none';
+  a.disabled=!s.bed_calibrating||!!s.bed_calib_aborting;
+  if(!s.bed_calib_aborting)a.textContent='Abort sweep';
   if(s.bed_calib_msg)h.textContent=s.bed_calib_msg;
  }
  async function refresh(){
@@ -717,12 +776,20 @@ class Handler(BaseHTTPRequestHandler):
             threading.Thread(target=run_calibration, daemon=True).start()
             log("calibrate: started via API (head will move, Z sweep)")
             self._send(200, "application/json", json.dumps({"started": True}).encode())
+        elif p == "/api/calib_abort":
+            ok = abort_calibration()
+            if not ok:
+                self._send(409, "application/json",
+                           json.dumps({"error": "no sweep running"}).encode())
+                return
+            self._send(200, "application/json", json.dumps({"aborting": True}).encode())
         else:
             self._send(404, "text/plain", b"not found")
 
 
 def main():
     log(f"config: {json.dumps({k: v for k, v in CFG.items() if 'PASS' not in k and 'TOKEN' not in k})}")
+    purge_calib_cron()  # calibration is button-only; kill any leftover scheduled sweep
     threading.Thread(target=poller, daemon=True).start()
     srv = ThreadingHTTPServer((CFG["HOST"], CFG["PORT"]), Handler)
     log(f"serving on http://{CFG['HOST']}:{CFG['PORT']}")

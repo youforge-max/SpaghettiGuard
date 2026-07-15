@@ -193,12 +193,14 @@ So references are indexed by **(15-min time slot, Z)**: `bed_ref_z/qNN/zNNN.png`
 slots/day. Each frame the detector picks the reference nearest the current toolhead Z
 within the slot nearest the current wall clock (cyclic).
 
-**Building the references** — press **Start 24h bed calibration** on the dashboard
-(bed must be EMPTY and stay empty). This:
-
-1. Installs a cron that runs a full **Z sweep** every 15 min for 24h (96 slots), then
-   removes itself once all slots are captured.
-2. Runs the first sweep immediately.
+**Building the references** — press **Capture bed reference** on the dashboard
+(bed must be EMPTY). One sweep runs per press and captures the **current** 15-min
+slot. There is **no schedule and no cron**: the head moves *only* while a sweep you
+started is running, and stops when it ends. To cover the day, press again in
+different slots; each press adds/refreshes that slot's stack. An **Abort sweep**
+button stops a running sweep immediately (it sends `SIGINT`, so fans are restored
+and the head halts cleanly). The Capture button is disabled while a sweep runs, so
+it can't be double-fired.
 
 Each sweep homes (`G28`), parks **back-left `X5 Y345`** — the SV08's post-print rest
 pose, where bed-clear detection actually runs — then steps Z `5→300 mm` in 1 mm steps
