@@ -39,8 +39,8 @@ BED_REF_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bed_ref
 BED_ROI = (0.00, 0.22, 1.00, 0.86)   # frac left,top,right,bottom of the frame
 BED_DOWNSAMPLE = (128, 72)
 BED_BLUR = 3
-BED_PIXEL_DELTA = 32                  # per-pixel grayscale abs-diff = "changed"
-BED_CHANGE_THRESHOLD = 0.02           # occupied if > this fraction of blocks changed
+BED_PIXEL_DELTA = 22                  # per-pixel grayscale abs-diff = "changed" (lowered: catch flat/faint objects)
+BED_CHANGE_THRESHOLD = 0.005          # occupied if > this fraction of blocks changed (lowered: false-positive OK, never let head slam an object)
 
 
 def bed_roi_gray(img):
@@ -52,12 +52,65 @@ def bed_roi_gray(img):
     return crop.resize(BED_DOWNSAMPLE)
 
 
+BED_REF_Z_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bed_ref_z")
+
+
 def load_bed_reference():
     try:
         return bed_roi_gray(Image.open(BED_REF_PATH).convert("RGB"))
     except Exception as e:  # noqa: BLE001
         log(f"bed: no reference ({e}); bed-clear disabled until --capture-reference")
         return None
+
+
+class BedRefStack:
+    """Z-indexed clear-bed reference stack (bed_ref_z/zNNN.png, X/Y locked).
+
+    The grazing cam sees the nozzle at a different apparent height per Z, so a
+    single reference is only valid at one Z. Post-print the head sits at a fixed
+    X/Y but a varying Z; pick the reference nearest the current Z so the nozzle
+    cancels in the diff. Falls back to the single bed_reference.png if no stack.
+    """
+
+    def __init__(self):
+        self.zs = []
+        self.cache = {}
+        self.single = None
+        try:
+            for fn in os.listdir(BED_REF_Z_DIR):
+                if fn.startswith("z") and fn.endswith(".png"):
+                    try:
+                        self.zs.append(int(fn[1:-4]))
+                    except ValueError:
+                        pass
+            self.zs.sort()
+        except FileNotFoundError:
+            pass
+        if not self.zs:
+            self.single = load_bed_reference()
+            log("bed: no Z-stack; using single bed_reference.png")
+        else:
+            log(f"bed: Z-stack loaded {len(self.zs)} refs "
+                f"(z{self.zs[0]}..z{self.zs[-1]})")
+
+    def ready(self):
+        return bool(self.zs) or self.single is not None
+
+    def get(self, z):
+        """Return (ref_small, chosen_z) nearest z, or (single, None)."""
+        if not self.zs:
+            return self.single, None
+        if z is None:
+            z = self.zs[len(self.zs) // 2]
+        nz = min(self.zs, key=lambda a: abs(a - z))
+        if nz not in self.cache:
+            try:
+                self.cache[nz] = bed_roi_gray(
+                    Image.open(os.path.join(BED_REF_Z_DIR, f"z{nz:03d}.png")).convert("RGB"))
+            except Exception as e:  # noqa: BLE001
+                log(f"bed: failed loading z{nz:03d}.png: {e}")
+                return self.single, None
+        return self.cache[nz], nz
 
 
 def bed_detect(frame_img, ref_small):
@@ -129,6 +182,7 @@ STATE = {
     "bed_ok": False,                   # False = no clear-bed reference loaded
     "bed_occupied": False,             # True = object detected on the bed
     "bed_changed": 0.0,                # fraction of bed blocks changed vs reference
+    "bed_ref_z": None,                 # Z (mm) of the reference chosen this frame (Z-stack)
 }
 LATEST_JPG = None
 
@@ -168,6 +222,16 @@ def moonraker_print_state():
         return ps.get("state"), (ps.get("filename") or None)
     except Exception:  # noqa: BLE001
         return None, None
+
+
+def moonraker_z():
+    """Current toolhead Z (mm), or None if unreachable/unhomed."""
+    url = CFG["MOONRAKER_URL"].rstrip("/") + "/printer/objects/query?toolhead"
+    try:
+        raw = http_get(url, timeout=6)
+        return float(json.loads(raw.decode())["result"]["status"]["toolhead"]["position"][2])
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def moonraker_pause():
@@ -241,7 +305,7 @@ def annotate(frame_bytes, dets, alert, streak, bed_box=None):
 def poller():
     global LATEST_JPG
     log(f"ml_api target {CFG['ML_API_URL']}  webcam {CFG['SNAPSHOT_URL']}")
-    bed_ref = load_bed_reference()
+    bed_stack = BedRefStack()
     while True:
         t0 = time.time()
         try:
@@ -253,11 +317,14 @@ def poller():
             pstate, pfile = moonraker_print_state()
 
             # bed-clear check (independent of the spaghetti model)
-            bed_occupied, bed_changed, bed_box = False, 0.0, None
-            if bed_ref is not None:
+            bed_occupied, bed_changed, bed_box, bed_ref_z = False, 0.0, None, None
+            if bed_stack.ready():
                 try:
-                    bed_occupied, bed_changed, bed_box = bed_detect(
-                        Image.open(io.BytesIO(frame)).convert("RGB"), bed_ref)
+                    cur_z = moonraker_z()
+                    bed_ref, bed_ref_z = bed_stack.get(cur_z)
+                    if bed_ref is not None:
+                        bed_occupied, bed_changed, bed_box = bed_detect(
+                            Image.open(io.BytesIO(frame)).convert("RGB"), bed_ref)
                 except Exception as e:  # noqa: BLE001
                     log(f"bed: detect failed: {e}")
 
@@ -288,9 +355,10 @@ def poller():
                 if pstate is not None:
                     STATE["printer_state"] = pstate
                     STATE["printer_file"] = pfile
-                STATE["bed_ok"] = bed_ref is not None
+                STATE["bed_ok"] = bed_stack.ready()
                 STATE["bed_occupied"] = bed_occupied
                 STATE["bed_changed"] = round(bed_changed, 4)
+                STATE["bed_ref_z"] = bed_ref_z
                 if positive:
                     STATE["pos_streak"] += 1
                     STATE["clean_streak"] = 0

@@ -9,3 +9,4 @@ snapshots/
 # bed-clear detector: per-install reference photo (regenerate with --capture-reference)
 bed_reference.png
 bed_snap_*.jpg
+bed_ref_z/
