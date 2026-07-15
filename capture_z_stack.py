@@ -70,26 +70,54 @@ def snapshot(retries=5):
     raise RuntimeError(f"snapshot failed: {last}")
 
 
+# Fans to silence during a sweep: only ones that move air/vibrate the frame.
+# NOT hotend_fan (heater_fan, Klipper-managed safety) or _mainboard_fan
+# (electronics cooling) — a timeout SIGKILL skips restore, so never leave
+# those off. Exhaust off is harmless on a cold idle bed.
+QUIET_FANS = ["Chamber_Exhaust", "fan0", "fan1"]
+
+
+def fan_speeds():
+    q = "&".join(f"fan_generic%20{f}" for f in QUIET_FANS)
+    s = get(f"/printer/objects/query?{q}")["result"]["status"]
+    return {f: float(s.get(f"fan_generic {f}", {}).get("speed", 0.0)) for f in QUIET_FANS}
+
+
+def set_fans(speeds):
+    for f, sp in speeds.items():
+        gcode(f"SET_FAN_SPEED FAN={f} SPEED={sp}")
+
+
 def main():
     st, _ = state_pos()
     if st == "printing":
         sys.exit("refusing: print running")
     OUTDIR.mkdir(exist_ok=True)
-    gcode(f"G90\nG1 X{PARK_X} Y{PARK_Y} F6000\nM400")
+    prior = fan_speeds()
+    print(f"fans off for sweep (were {prior})", flush=True)
+    set_fans({f: 0 for f in QUIET_FANS})
     n = 0
-    for z in range(Z_START, Z_END + 1, Z_STEP):
-        gcode(f"G1 Z{z} F900\nM400")
-        # confirm Z landed
-        for _ in range(20):
-            time.sleep(0.2)
-            _, pos = state_pos()
-            if abs(pos[2] - z) < 0.2:
-                break
-        time.sleep(0.6)  # frame settle
-        img = snapshot()
-        img.save(OUTDIR / f"z{z:03d}.png")
-        n += 1
-        print(f"z={z:3d}  saved z{z:03d}.png  (X{pos[0]:.0f} Y{pos[1]:.0f})", flush=True)
+    try:
+        gcode(f"G90\nG1 X{PARK_X} Y{PARK_Y} F6000\nM400")
+        for z in range(Z_START, Z_END + 1, Z_STEP):
+            gcode(f"G1 Z{z} F900\nM400")
+            # confirm Z landed
+            for _ in range(20):
+                time.sleep(0.2)
+                _, pos = state_pos()
+                if abs(pos[2] - z) < 0.2:
+                    break
+            time.sleep(0.6)  # frame settle
+            img = snapshot()
+            img.save(OUTDIR / f"z{z:03d}.png")
+            n += 1
+            print(f"z={z:3d}  saved z{z:03d}.png  (X{pos[0]:.0f} Y{pos[1]:.0f})", flush=True)
+    finally:
+        try:
+            set_fans(prior)
+            print(f"fans restored to {prior}", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"WARN: fan restore failed: {e}", flush=True)
     print(f"DONE: {n} references in {OUTDIR}")
 
 
