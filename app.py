@@ -65,35 +65,54 @@ def load_bed_reference():
         return None
 
 
-def _hour_cyclic_dist(a, b):
-    d = abs(a - b) % 24
-    return min(d, 24 - d)
+SLOTS_PER_DAY = 96               # 15-min buckets (1440 / 15)
+
+
+def _slot_cyclic_dist(a, b):
+    d = abs(a - b) % SLOTS_PER_DAY
+    return min(d, SLOTS_PER_DAY - d)
+
+
+def slot_now(now=None):
+    """15-min slot 0..95 for the given/current wall clock."""
+    now = now or dt.datetime.now()
+    return (now.hour * 60 + now.minute) // 15
 
 
 class BedRefStack:
-    """Clear-bed reference stack indexed by (hour-of-day, Z), X/Y locked.
+    """Clear-bed reference stack indexed by (15-min time slot, Z), X/Y locked.
 
     Two things move the empty-bed image: (1) Z — the grazing cam sees the nozzle
     at a different apparent height per Z; (2) time of day — the printer is by a
     window, so daylight shifts the *shadows*, not just brightness (exposure-
-    normalise only cancels global brightness). So references live in per-hour
-    dirs bed_ref_z/hHH/zNNN.png. Each frame we pick the reference nearest the
-    current toolhead Z within the hour-dir nearest the current wall-clock hour
-    (cyclic). Falls back to a single legacy bed_reference.png if no stack.
+    normalise only cancels global brightness). Daylight near a window moves fast
+    at dawn/dusk, so time is bucketed every 15 min (96 slots/day), not hourly.
+    References live in per-slot dirs bed_ref_z/qNN/zNNN.png. Each frame we pick
+    the reference nearest the current Z within the slot-dir nearest the current
+    slot (cyclic). Legacy hourly dirs hHH map to slot HH*4. Falls back to a
+    single legacy bed_reference.png if no stack.
     """
 
     def __init__(self):
-        self.hours = {}          # hour_int -> sorted [z_int, ...]
-        self.cache = {}          # (hour_int, z_int) -> ref_small
+        self.slots = {}          # slot_int -> (tag_dirname, sorted [z_int, ...])
+        self.cache = {}          # (slot_int, z_int) -> ref_small
         self.single = None
         try:
             for tag in os.listdir(BED_REF_Z_DIR):
                 d = os.path.join(BED_REF_Z_DIR, tag)
-                if not (tag.startswith("h") and os.path.isdir(d)):
+                if not os.path.isdir(d):
                     continue
-                try:
-                    hh = int(tag[1:])
-                except ValueError:
+                if tag.startswith("q"):
+                    try:
+                        slot = int(tag[1:]) % SLOTS_PER_DAY
+                    except ValueError:
+                        continue
+                elif tag.startswith("h"):     # legacy hourly dir
+                    try:
+                        slot = (int(tag[1:]) * 4) % SLOTS_PER_DAY
+                    except ValueError:
+                        continue
+                else:
                     continue
                 zs = []
                 for fn in os.listdir(d):
@@ -103,39 +122,39 @@ class BedRefStack:
                         except ValueError:
                             pass
                 if zs:
-                    self.hours[hh] = sorted(zs)
+                    self.slots[slot] = (tag, sorted(zs))
         except FileNotFoundError:
             pass
-        if not self.hours:
+        if not self.slots:
             self.single = load_bed_reference()
-            log("bed: no Z/hour-stack; using single bed_reference.png")
+            log("bed: no Z/slot-stack; using single bed_reference.png")
         else:
-            tot = sum(len(v) for v in self.hours.values())
-            log(f"bed: stack loaded {tot} refs across {len(self.hours)} hours "
-                f"{sorted(self.hours)}")
+            tot = sum(len(v[1]) for v in self.slots.values())
+            log(f"bed: stack loaded {tot} refs across {len(self.slots)} slots "
+                f"{sorted(self.slots)}")
 
     def ready(self):
-        return bool(self.hours) or self.single is not None
+        return bool(self.slots) or self.single is not None
 
-    def get(self, z, hour):
-        """Return (ref_small, chosen_z, chosen_hour); (single, None, None) if flat."""
-        if not self.hours:
+    def get(self, z, slot):
+        """Return (ref_small, chosen_z, chosen_slot); (single, None, None) if flat."""
+        if not self.slots:
             return self.single, None, None
-        if hour is None:
-            hour = 12
-        nh = min(self.hours, key=lambda h: (_hour_cyclic_dist(h, hour), h))
-        zs = self.hours[nh]
+        if slot is None:
+            slot = slot_now()
+        ns = min(self.slots, key=lambda s: (_slot_cyclic_dist(s, slot), s))
+        tag, zs = self.slots[ns]
         zref = zs[len(zs) // 2] if z is None else min(zs, key=lambda a: abs(a - z))
-        key = (nh, zref)
+        key = (ns, zref)
         if key not in self.cache:
             try:
                 self.cache[key] = bed_roi_gray(Image.open(
-                    os.path.join(BED_REF_Z_DIR, f"h{nh:02d}", f"z{zref:03d}.png")
+                    os.path.join(BED_REF_Z_DIR, tag, f"z{zref:03d}.png")
                 ).convert("RGB"))
             except Exception as e:  # noqa: BLE001
-                log(f"bed: failed loading h{nh:02d}/z{zref:03d}.png: {e}")
+                log(f"bed: failed loading {tag}/z{zref:03d}.png: {e}")
                 return self.single, None, None
-        return self.cache[key], zref, nh
+        return self.cache[key], zref, ns
 
 
 def bed_detect(frame_img, ref_small):
@@ -208,7 +227,7 @@ STATE = {
     "bed_occupied": False,             # True = object detected on the bed
     "bed_changed": 0.0,                # fraction of bed blocks changed vs reference
     "bed_ref_z": None,                 # Z (mm) of the reference chosen this frame (Z-stack)
-    "bed_ref_hour": None,              # hour-of-day bucket of the reference chosen this frame
+    "bed_ref_slot": None,              # 15-min time slot (0..95) of the reference chosen this frame
     "bed_calibrating": False,          # True while a Z-stack sweep is running
     "bed_calib_msg": "",               # last calibration result/status line
 }
@@ -266,7 +285,7 @@ def run_calibration():
     """Run a full Z-stack sweep for the current hour (blocking; call in a thread).
 
     Moves the head (Z only, X/Y locked) capturing empty-bed references into
-    bed_ref_z/hHH/. Head motion is the caller's responsibility to authorise; the
+    bed_ref_z/qNN/. Head motion is the caller's responsibility to authorise; the
     sweep script itself refuses if a print is running. The live BedRefStack picks
     up the new dir at its next 15-min reload.
     """
@@ -366,7 +385,7 @@ def poller():
     bed_stack_loaded = time.time()
     while True:
         t0 = time.time()
-        if t0 - bed_stack_loaded > 900:   # reload every 15min: pick up new hourly dirs
+        if t0 - bed_stack_loaded > 300:   # reload every 5min: pick up new 15-min slot dirs
             bed_stack = BedRefStack()
             bed_stack_loaded = t0
         try:
@@ -382,7 +401,7 @@ def poller():
             if bed_stack.ready():
                 try:
                     cur_z = moonraker_z()
-                    bed_ref, bed_ref_z, bed_ref_h = bed_stack.get(cur_z, dt.datetime.now().hour)
+                    bed_ref, bed_ref_z, bed_ref_h = bed_stack.get(cur_z, slot_now())
                     if bed_ref is not None:
                         bed_occupied, bed_changed, bed_box = bed_detect(
                             Image.open(io.BytesIO(frame)).convert("RGB"), bed_ref)
@@ -420,7 +439,7 @@ def poller():
                 STATE["bed_occupied"] = bed_occupied
                 STATE["bed_changed"] = round(bed_changed, 4)
                 STATE["bed_ref_z"] = bed_ref_z
-                STATE["bed_ref_hour"] = bed_ref_h
+                STATE["bed_ref_slot"] = bed_ref_h
                 if positive:
                     STATE["pos_streak"] += 1
                     STATE["clean_streak"] = 0
@@ -574,7 +593,7 @@ PAGE = """<!doctype html><html><head><meta charset=utf-8>
    b.className='badge '+(a?'alert':'ok');
    const rows=[
     ['Bed',!s.bed_ok?'no reference':(s.bed_occupied?'OBJECT ('+(s.bed_changed*100).toFixed(1)+'%)':'clear')],
-    ['Bed ref',s.bed_ref_z!=null?('z'+s.bed_ref_z+' / h'+s.bed_ref_hour):'—'],
+    ['Bed ref',s.bed_ref_z!=null?('z'+s.bed_ref_z+' / q'+s.bed_ref_slot):'—'],
     ['Printer',s.printer_ok?s.printer_state:'unreachable'],
     ['Print file',s.printer_file||'—'],
     ['ml_api',s.ml_ok?'up':'DOWN'],['Score',s.score_ms+' ms'],

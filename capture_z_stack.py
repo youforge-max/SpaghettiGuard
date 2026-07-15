@@ -19,11 +19,19 @@ from PIL import Image
 
 MOONRAKER = "http://192.168.0.72"
 SNAPSHOT_URL = f"{MOONRAKER}/webcam/?action=snapshot"
-# Per-hour reference dirs (lighting shifts over the day: window sun moves the
-# shadows, not just brightness). Default = current hour bucket bed_ref_z/hHH/.
-# Override with argv[1] (an hour tag like "h07") for testing.
+# Per-slot reference dirs (lighting shifts over the day: window sun moves the
+# shadows, not just brightness — and fast at dawn/dusk). Time is bucketed every
+# 15 min (96 slots/day). Default = current slot bucket bed_ref_z/qNN/.
+# Override with argv[1] (a slot tag like "q34") for testing.
 _ROOT = Path(__file__).resolve().parent / "bed_ref_z"
-_TAG = sys.argv[1] if len(sys.argv) > 1 else f"h{dt.datetime.now():%H}"
+
+
+def _slot_tag(now=None):
+    now = now or dt.datetime.now()
+    return f"q{(now.hour * 60 + now.minute) // 15:02d}"
+
+
+_TAG = sys.argv[1] if len(sys.argv) > 1 else _slot_tag()
 OUTDIR = _ROOT / _TAG
 
 PARK_X, PARK_Y = 5.0, 345.0     # locked X/Y (current print-end-style pose)
