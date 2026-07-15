@@ -281,25 +281,49 @@ def moonraker_z():
         return None
 
 
-def run_calibration():
-    """Run a full Z-stack sweep for the current hour (blocking; call in a thread).
+CALIB_CRON = "*/15 * * * * /home/openclaw/spaghetti-detector/capture_15min.sh"
 
-    Moves the head (Z only, X/Y locked) capturing empty-bed references into
-    bed_ref_z/qNN/. Head motion is the caller's responsibility to authorise; the
-    sweep script itself refuses if a print is running. The live BedRefStack picks
-    up the new dir at its next 15-min reload.
+
+def install_calib_cron():
+    """(Re)install the 15-min build cron. The build self-removes it once all 96
+    slot-dirs are full (see capture_15min.sh). Idempotent."""
+    try:
+        cur = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+        lines = [ln for ln in (cur.stdout or "").splitlines()
+                 if "capture_15min.sh" not in ln and "capture_hourly.sh" not in ln]
+        lines.append(CALIB_CRON)
+        subprocess.run(["crontab", "-"], input="\n".join(lines) + "\n", text=True, check=True)
+        return True
+    except Exception as e:  # noqa: BLE001
+        log(f"calibrate: cron install failed: {e}")
+        return False
+
+
+def run_calibration():
+    """Start the 24h build on button press (blocking first sweep; call in a thread).
+
+    Installs the 15-min cron so a full Z-stack sweep runs every 15 min into
+    bed_ref_z/qNN/ until all 96 slots are captured (cron self-removes then). Also
+    runs the first sweep immediately so the user sees motion at press. Moves the
+    head (Z only, X/Y locked); the sweep script refuses if a print is running.
+    The live BedRefStack picks up new slot-dirs at its next reload.
     """
     here = os.path.dirname(os.path.abspath(__file__))
+    cron_ok = install_calib_cron()
     with LOCK:
         STATE["bed_calibrating"] = True
-        STATE["bed_calib_msg"] = f"sweeping Z since {dt.datetime.now():%H:%M:%S}..."
+        STATE["bed_calib_msg"] = (
+            f"24h build started {dt.datetime.now():%H:%M} — sweeping first slot..."
+            if cron_ok else
+            f"cron install FAILED — running one-off sweep {dt.datetime.now():%H:%M}...")
     try:
         r = subprocess.run([sys.executable, os.path.join(here, "capture_z_stack.py")],
                            capture_output=True, text=True, timeout=1800, cwd=here)
         last = (r.stdout or "").strip().splitlines()
         tail = last[-1] if last else ""
         if r.returncode == 0:
-            msg = f"done {dt.datetime.now():%H:%M}: {tail}"
+            build = "24h build running (every 15 min)" if cron_ok else "one-off done"
+            msg = f"{build}; first sweep {dt.datetime.now():%H:%M}: {tail}"
         else:
             msg = f"failed rc={r.returncode}: {((r.stderr or tail) or '')[:180]}"
     except Exception as e:  # noqa: BLE001
@@ -569,7 +593,7 @@ PAGE = """<!doctype html><html><head><meta charset=utf-8>
   else{b.textContent='bed: clear';b.style.background='#1a3d1a';b.style.color='#7ee787';}
  }
  async function calibrate(){
-  if(!confirm('Start empty-bed calibration now?\nThe head WILL move (Z sweep to Z max, several minutes). The bed must be EMPTY.'))return;
+  if(!confirm('Start the 24h empty-bed calibration build now?\nA full Z sweep runs immediately and then every 15 min for 24h (96 slots), so references track daylight. The head WILL move (Z sweep, several min each). The bed must be EMPTY and stay empty. Auto-stops when all 96 slots are captured.'))return;
   try{
    const r=await fetch('/api/calibrate',{method:'POST'});
    const j=await r.json();
@@ -579,7 +603,7 @@ PAGE = """<!doctype html><html><head><meta charset=utf-8>
  function paintCalib(s){
   const b=document.getElementById('calibbtn'),h=document.getElementById('calibhint');
   b.disabled=!!s.bed_calibrating;
-  b.textContent=s.bed_calibrating?'Calibrating… (head moving)':'Calibrate empty bed (Z sweep)';
+  b.textContent=s.bed_calibrating?'Calibrating… (head moving)':'Start 24h bed calibration';
   b.style.opacity=s.bed_calibrating?'0.6':'1';
   if(s.bed_calib_msg)h.textContent=s.bed_calib_msg;
  }
