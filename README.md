@@ -175,11 +175,50 @@ the print (a window at dusk) is the usual source of false positives.
 If you're not yet convinced it can tell spaghetti from your prints, run with `AUTO_PAUSE=0`
 for a few jobs and watch the alerts, then turn it on.
 
+## Bed-clear calibration (work in progress)
+
+The ML model ignores the bed, so a finished part looks the same as an empty bed. A
+separate **reference-diff** check answers "is the bed clear?" — it compares the live
+frame against a stored photo of the *empty* bed and flags any change. Useful as a
+crash guard before the next job.
+
+Two things move the empty-bed image on this rig (a low, grazing webcam next to a
+window), so a single reference is not enough:
+
+- **Z height** — the grazing cam sees the nozzle at a different apparent height per Z.
+- **Time of day** — daylight shifts the *shadows*, not just brightness, and moves fast
+  at dawn/dusk.
+
+So references are indexed by **(15-min time slot, Z)**: `bed_ref_z/qNN/zNNN.png`, 96
+slots/day. Each frame the detector picks the reference nearest the current toolhead Z
+within the slot nearest the current wall clock (cyclic).
+
+**Building the references** — press **Start 24h bed calibration** on the dashboard
+(bed must be EMPTY and stay empty). This:
+
+1. Installs a cron that runs a full **Z sweep** every 15 min for 24h (96 slots), then
+   removes itself once all slots are captured.
+2. Runs the first sweep immediately.
+
+Each sweep homes (`G28`), parks **back-left `X5 Y345`** — the SV08's post-print rest
+pose, where bed-clear detection actually runs — then steps Z `5→300 mm` in 1 mm steps
+(~8 min), capturing the empty bed at each height. During a sweep it silences the
+**chamber exhaust + toolhead fans** (airflow/vibration disturbs the frame) and restores
+them after; the **bottom host-cooling fan and hotend fan are left untouched** for
+thermal safety. The head **moves** — never start it during a print (the sweep refuses
+if one is running).
+
+Bias is intentionally toward **false positives**: a spurious "object" is cheap, a
+toolhead crashing into a missed part is not.
+
+> Still under active development — thresholds and the reference set are being tuned.
+
 ## What it is not
 
-SpaghettiGuard detects **spaghetti and print failures**. It does not tell you whether the
-bed is clear, whether the right part is on it, or whether a print finished cleanly — a
-finished part sitting on the bed produces no detections, exactly like an empty bed does.
+SpaghettiGuard's ML model detects **spaghetti and print failures** only. On its own it
+does not tell you whether the bed is clear, whether the right part is on it, or whether
+a print finished cleanly — a finished part produces no detections, exactly like an empty
+bed. The bed-clear check above is a separate reference-diff layer, not the ML model.
 Don't use "no detections" as proof that anything is present or absent.
 
 ## Credits
