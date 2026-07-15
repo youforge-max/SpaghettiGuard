@@ -98,6 +98,9 @@ def main():
     set_fans({f: 0 for f in QUIET_FANS})
     n = 0
     try:
+        # Home first, then park at the back-left corner — the SV08's post-print
+        # rest pose (X5 Y345), so references match where the head sits after a job.
+        gcode("G28\nM400")
         gcode(f"G90\nG1 X{PARK_X} Y{PARK_Y} F6000\nM400")
         for z in range(Z_START, Z_END + 1, Z_STEP):
             gcode(f"G1 Z{z} F900\nM400")
