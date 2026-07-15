@@ -538,7 +538,7 @@ def poller():
 
 
 PAGE = """<!doctype html><html><head><meta charset=utf-8>
-<title>Spaghetti Detector — SV08</title>
+<title>Spaghetti Detector — SV08</title><link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🍝</text></svg>">
 <meta name=viewport content="width=device-width,initial-scale=1">
 <style>
  body{background:#0d1117;color:#c9d1d9;font:14px/1.5 system-ui,sans-serif;margin:0}
