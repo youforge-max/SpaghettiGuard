@@ -1,8 +1,5 @@
 # 🍝 SpaghettiGuard
 
-> **⚠️ WORK IN PROGRESS — NOT PRODUCTION READY ⚠️**
-> Bed-clear calibration (Z/time-slot reference build) is under active development.
-
 > Self-hosted, no-cloud, free 3D-print spaghetti/failure detector — Obico ml_api (CPU) + webcam poller + live dashboard. Notify-only or optional Moonraker auto-pause.
 
 <p align="center">
@@ -75,9 +72,7 @@ the camera, debounces detections into stable alerts, and gives you a dashboard a
 > always-on machine**, not on the printer's own SBC (e.g. a 1 GB Pi/CB1 already
 > running Klipper). On such a host the inference would contend with Klipper's
 > realtime loop — risking print stutter — and can exhaust RAM. Point `SNAPSHOT_URL`
-> and `MOONRAKER_URL` at the printer over the LAN instead. Only the lightweight
-> **bed-clear** check (Pillow-only, no ml_api) is cheap enough to co-locate on the
-> printer host if you ever split the two.
+> and `MOONRAKER_URL` at the printer over the LAN instead.
 
 ## Install
 
@@ -185,72 +180,12 @@ the print (a window at dusk) is the usual source of false positives.
 If you're not yet convinced it can tell spaghetti from your prints, run with `AUTO_PAUSE=0`
 for a few jobs and watch the alerts, then turn it on.
 
-## Bed-clear calibration (work in progress)
-
-The ML model ignores the bed, so a finished part looks the same as an empty bed. A
-separate **reference-diff** check answers "is the bed clear?" — it compares the live
-frame against a stored photo of the *empty* bed and flags any change. Useful as a
-crash guard before the next job.
-
-Two things move the empty-bed image on this rig (a low, grazing webcam next to a
-window), so a single reference is not enough:
-
-- **Z height** — the grazing cam sees the nozzle at a different apparent height per Z.
-- **Time of day** — daylight shifts the *shadows*, not just brightness, and moves fast
-  at dawn/dusk.
-
-So references are indexed by **(15-min time slot, Z)**: `bed_ref_z/qNN/zNNN.png`, 96
-slots/day. Each frame the detector picks the reference nearest the current toolhead Z
-within the slot nearest the current wall clock (cyclic).
-
-**Building the references** — press **Capture bed reference** on the dashboard
-(bed must be EMPTY). One sweep runs per press and captures the **current** 15-min
-slot. There is **no schedule and no cron**: the head moves *only* while a sweep you
-started is running, and stops when it ends. To cover the day, press again in
-different slots; each press adds/refreshes that slot's stack. An **Abort sweep**
-button stops a running sweep immediately (it sends `SIGINT`, so fans are restored
-and the head halts cleanly). The Capture button is disabled while a sweep runs, so
-it can't be double-fired.
-
-Each sweep homes (`G28`), parks **back-left `X5 Y345`** — the SV08's post-print rest
-pose, where bed-clear detection actually runs — then steps Z `5→300 mm` in 1 mm steps
-(~8 min), capturing the empty bed at each height. During a sweep it silences the
-**chamber exhaust + toolhead fans** (airflow/vibration disturbs the frame) and restores
-them after; the **bottom host-cooling fan and hotend fan are left untouched** for
-thermal safety. The head **moves** — never start it during a print (the sweep refuses
-if one is running).
-
-Bias is intentionally toward **false positives**: a spurious "object" is cheap, a
-toolhead crashing into a missed part is not.
-
-### Standalone / scheduled check (`bed_check.py`)
-
-Besides the live dashboard, bed-clear detection also works as a one-shot CLI —
-handy for a scheduled crash-guard between jobs:
-
-```bash
-python3 bed_check.py --capture-reference   # run once, bed actually empty
-python3 bed_check.py --check               # prints CLEAR / OCCUPIED + match%
-python3 bed_check.py --check --no-park      # skip the park (head already positioned)
-```
-
-Exit code: `0` = clear, `2` = occupied, `1` = error / no reference. Each `--check`
-parks the head to the reference pose first and **refuses to run while a print is
-active**, so it's safe to schedule. To poll periodically (e.g. an hourly bed-clear
-sweep over a day) wrap it in a loop or a cron/systemd-timer entry that runs
-`bed_check.py --check` on your interval and logs the verdict — the exit code drives
-any alerting you bolt on. Keep the head parked at the same pose the reference was
-captured at, or the toolhead itself reads as a false "occupied".
-
-> Still under active development — thresholds and the reference set are being tuned.
-
 ## What it is not
 
 SpaghettiGuard's ML model detects **spaghetti and print failures** only. On its own it
 does not tell you whether the bed is clear, whether the right part is on it, or whether
 a print finished cleanly — a finished part produces no detections, exactly like an empty
-bed. The bed-clear check above is a separate reference-diff layer, not the ML model.
-Don't use "no detections" as proof that anything is present or absent.
+bed. Don't use "no detections" as proof that anything is present or absent.
 
 ## Credits
 

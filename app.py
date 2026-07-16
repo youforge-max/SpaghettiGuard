@@ -12,177 +12,20 @@ AUTO_PAUSE=0 for notify-only. It is also toggleable live from the dashboard
 """
 import io
 import os
-import sys
 import json
 import time
-import signal
-import subprocess
 import threading
 import datetime as dt
 import urllib.request
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageChops, ImageStat
+from PIL import Image, ImageDraw
 
 
 def env(k, d=None):
     v = os.environ.get(k)
     return v if v not in (None, "") else d
-
-
-# --- Bed-clear detection (reference-diff, PIL-only, no numpy) ------------------
-# Separate from the Obico spaghetti model: that finds tangled-filament failures,
-# this answers "is a solid object on the bed" by diffing against a stored clear-bed
-# reference. Only valid while the toolhead sits where the reference was captured
-# (the head must not move between reference and check) — same nozzle position
-# cancels in the diff. Camera is low/grazing: objects behind the toolhead or
-# very flat can hide (see bed_check.py CAMERA CAVEAT).
-BED_REF_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bed_reference.png")
-BED_ROI = (0.00, 0.22, 1.00, 0.86)   # frac left,top,right,bottom of the frame
-BED_DOWNSAMPLE = (128, 72)
-BED_BLUR = 3
-BED_PIXEL_DELTA = 22                  # per-pixel grayscale abs-diff = "changed" (lowered: catch flat/faint objects)
-BED_CHANGE_THRESHOLD = 0.005          # occupied if > this fraction of blocks changed (lowered: false-positive OK, never let head slam an object)
-
-
-def bed_roi_gray(img):
-    """Crop to BED_ROI, grayscale, blur, downsample — the comparison form."""
-    w, h = img.size
-    l, t, r, b = BED_ROI
-    crop = img.crop((int(l * w), int(t * h), int(r * w), int(b * h)))
-    crop = crop.convert("L").filter(ImageFilter.GaussianBlur(BED_BLUR))
-    return crop.resize(BED_DOWNSAMPLE)
-
-
-BED_REF_Z_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bed_ref_z")
-
-
-def load_bed_reference():
-    try:
-        return bed_roi_gray(Image.open(BED_REF_PATH).convert("RGB"))
-    except Exception as e:  # noqa: BLE001
-        log(f"bed: no reference ({e}); bed-clear disabled until --capture-reference")
-        return None
-
-
-SLOTS_PER_DAY = 96               # 15-min buckets (1440 / 15)
-
-
-def _slot_cyclic_dist(a, b):
-    d = abs(a - b) % SLOTS_PER_DAY
-    return min(d, SLOTS_PER_DAY - d)
-
-
-def slot_now(now=None):
-    """15-min slot 0..95 for the given/current wall clock."""
-    now = now or dt.datetime.now()
-    return (now.hour * 60 + now.minute) // 15
-
-
-class BedRefStack:
-    """Clear-bed reference stack indexed by (15-min time slot, Z), X/Y locked.
-
-    Two things move the empty-bed image: (1) Z — the grazing cam sees the nozzle
-    at a different apparent height per Z; (2) time of day — the printer is by a
-    window, so daylight shifts the *shadows*, not just brightness (exposure-
-    normalise only cancels global brightness). Daylight near a window moves fast
-    at dawn/dusk, so time is bucketed every 15 min (96 slots/day), not hourly.
-    References live in per-slot dirs bed_ref_z/qNN/zNNN.png. Each frame we pick
-    the reference nearest the current Z within the slot-dir nearest the current
-    slot (cyclic). Legacy hourly dirs hHH map to slot HH*4. Falls back to a
-    single legacy bed_reference.png if no stack.
-    """
-
-    def __init__(self):
-        self.slots = {}          # slot_int -> (tag_dirname, sorted [z_int, ...])
-        self.cache = {}          # (slot_int, z_int) -> ref_small
-        self.single = None
-        try:
-            for tag in os.listdir(BED_REF_Z_DIR):
-                d = os.path.join(BED_REF_Z_DIR, tag)
-                if not os.path.isdir(d):
-                    continue
-                if tag.startswith("q"):
-                    try:
-                        slot = int(tag[1:]) % SLOTS_PER_DAY
-                    except ValueError:
-                        continue
-                elif tag.startswith("h"):     # legacy hourly dir
-                    try:
-                        slot = (int(tag[1:]) * 4) % SLOTS_PER_DAY
-                    except ValueError:
-                        continue
-                else:
-                    continue
-                zs = []
-                for fn in os.listdir(d):
-                    if fn.startswith("z") and fn.endswith(".png"):
-                        try:
-                            zs.append(int(fn[1:-4]))
-                        except ValueError:
-                            pass
-                if zs:
-                    self.slots[slot] = (tag, sorted(zs))
-        except FileNotFoundError:
-            pass
-        if not self.slots:
-            self.single = load_bed_reference()
-            log("bed: no Z/slot-stack; using single bed_reference.png")
-        else:
-            tot = sum(len(v[1]) for v in self.slots.values())
-            log(f"bed: stack loaded {tot} refs across {len(self.slots)} slots "
-                f"{sorted(self.slots)}")
-
-    def ready(self):
-        return bool(self.slots) or self.single is not None
-
-    def get(self, z, slot):
-        """Return (ref_small, chosen_z, chosen_slot); (single, None, None) if flat."""
-        if not self.slots:
-            return self.single, None, None
-        if slot is None:
-            slot = slot_now()
-        ns = min(self.slots, key=lambda s: (_slot_cyclic_dist(s, slot), s))
-        tag, zs = self.slots[ns]
-        zref = zs[len(zs) // 2] if z is None else min(zs, key=lambda a: abs(a - z))
-        key = (ns, zref)
-        if key not in self.cache:
-            try:
-                self.cache[key] = bed_roi_gray(Image.open(
-                    os.path.join(BED_REF_Z_DIR, tag, f"z{zref:03d}.png")
-                ).convert("RGB"))
-            except Exception as e:  # noqa: BLE001
-                log(f"bed: failed loading {tag}/z{zref:03d}.png: {e}")
-                return self.single, None, None
-        return self.cache[key], zref, ns
-
-
-def bed_detect(frame_img, ref_small):
-    """Diff frame vs clear reference. Return (occupied, changed_frac, box_or_None).
-    box is [x0,y0,x1,y1] in full-frame pixel coords."""
-    cur = bed_roi_gray(frame_img)
-    # cancel auto-exposure drift: shift cur so its mean matches the reference
-    delta = int(round(ImageStat.Stat(ref_small).mean[0] - ImageStat.Stat(cur).mean[0]))
-    if delta:
-        cur = cur.point(lambda v, d=delta: max(0, min(255, v + d)))
-    diff = ImageChops.difference(ref_small, cur)
-    mask = diff.point(lambda v: 255 if v > BED_PIXEL_DELTA else 0)
-    total = BED_DOWNSAMPLE[0] * BED_DOWNSAMPLE[1]
-    changed = mask.histogram()[255] / total
-    occupied = changed > BED_CHANGE_THRESHOLD
-    box = None
-    if occupied:
-        bb = mask.getbbox()  # in downsample coords
-        if bb:
-            fw, fh = frame_img.size
-            l, t, r, b = BED_ROI
-            rx = (r - l) * fw / BED_DOWNSAMPLE[0]
-            ry = (b - t) * fh / BED_DOWNSAMPLE[1]
-            ox, oy = l * fw, t * fh
-            box = [ox + bb[0] * rx, oy + bb[1] * ry,
-                   ox + bb[2] * rx, oy + bb[3] * ry]
-    return occupied, changed, box
 
 
 CFG = {
@@ -224,14 +67,6 @@ STATE = {
     "printer_state": "?",              # from Moonraker print_stats: printing/paused/complete/standby/...
     "printer_file": None,
     "printer_ok": False,               # False = Moonraker unreachable
-    "bed_ok": False,                   # False = no clear-bed reference loaded
-    "bed_occupied": False,             # True = object detected on the bed
-    "bed_changed": 0.0,                # fraction of bed blocks changed vs reference
-    "bed_ref_z": None,                 # Z (mm) of the reference chosen this frame (Z-stack)
-    "bed_ref_slot": None,              # 15-min time slot (0..95) of the reference chosen this frame
-    "bed_calibrating": False,          # True while a Z-stack sweep is running
-    "bed_calib_aborting": False,       # True once Abort pressed, until the sweep exits
-    "bed_calib_msg": "",               # last calibration result/status line
 }
 LATEST_JPG = None
 
@@ -271,111 +106,6 @@ def moonraker_print_state():
         return ps.get("state"), (ps.get("filename") or None)
     except Exception:  # noqa: BLE001
         return None, None
-
-
-def moonraker_z():
-    """Current toolhead Z (mm), or None if unreachable/unhomed."""
-    url = CFG["MOONRAKER_URL"].rstrip("/") + "/printer/objects/query?toolhead"
-    try:
-        raw = http_get(url, timeout=6)
-        return float(json.loads(raw.decode())["result"]["status"]["toolhead"]["position"][2])
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def purge_calib_cron():
-    """Remove any leftover build cron so the head NEVER sweeps unprompted.
-    Calibration is button-only now — no scheduled sweeps exist. Called at
-    startup and after every manual sweep as a safety net."""
-    try:
-        cur = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
-        lines = [ln for ln in (cur.stdout or "").splitlines()
-                 if "capture_15min.sh" not in ln and "capture_hourly.sh" not in ln]
-        subprocess.run(["crontab", "-"], input="\n".join(lines) + ("\n" if lines else ""),
-                       text=True, check=True)
-    except Exception as e:  # noqa: BLE001
-        log(f"calibrate: cron purge failed: {e}")
-
-
-CALIB_PROC = None       # running capture_z_stack.py Popen, or None. Guarded by LOCK.
-
-
-def run_calibration():
-    """Run ONE clear-bed Z sweep on button press (blocking; call in a thread).
-
-    Captures a full Z-stack into bed_ref_z/qNN/ for the CURRENT 15-min slot only.
-    No cron, no scheduled sweeps — the head moves solely as a direct result of the
-    press and stops when this sweep ends (or Abort). Z only, X/Y locked; the sweep
-    script refuses if a print is running. Press again (any slot, any time of day)
-    to add references; the live BedRefStack picks up new slot-dirs at next reload.
-    """
-    global CALIB_PROC
-    here = os.path.dirname(os.path.abspath(__file__))
-    purge_calib_cron()  # belt-and-braces: kill any stray scheduled sweep
-    try:
-        proc = subprocess.Popen(
-            [sys.executable, os.path.join(here, "capture_z_stack.py")],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=here)
-    except Exception as e:  # noqa: BLE001
-        with LOCK:
-            STATE["bed_calibrating"] = False
-            STATE["bed_calib_msg"] = f"error: {e}"
-        return
-    with LOCK:
-        CALIB_PROC = proc
-        STATE["bed_calibrating"] = True
-        STATE["bed_calib_msg"] = f"sweep started {dt.datetime.now():%H:%M} — capturing this slot..."
-    aborted = False
-    try:
-        out, err = proc.communicate(timeout=1800)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        out, err = proc.communicate()
-        err = (err or "") + " [timeout 1800s — killed]"
-    tail = (out or "").strip().splitlines()
-    tail = tail[-1] if tail else ""
-    with LOCK:
-        aborted = STATE.get("bed_calib_aborting", False)
-        STATE["bed_calib_aborting"] = False
-    if aborted:
-        msg = f"aborted {dt.datetime.now():%H:%M} (head stopped, fans restored)"
-    elif proc.returncode == 0:
-        msg = f"sweep done {dt.datetime.now():%H:%M}: {tail}"
-    else:
-        msg = f"failed rc={proc.returncode}: {((err or tail) or '')[:180]}"
-    log(f"calibrate: {msg}")
-    with LOCK:
-        CALIB_PROC = None
-        STATE["bed_calibrating"] = False
-        STATE["bed_calib_msg"] = msg
-
-
-def abort_calibration():
-    """Stop a running sweep. SIGINT (not kill) so capture_z_stack's finally runs:
-    restores fans + releases the flock. Escalates to kill if it ignores SIGINT."""
-    with LOCK:
-        proc = CALIB_PROC
-        if proc is None or proc.poll() is not None:
-            return False
-        STATE["bed_calib_aborting"] = True
-        STATE["bed_calib_msg"] = "aborting — stopping head, restoring fans..."
-    try:
-        proc.send_signal(signal.SIGINT)
-    except Exception as e:  # noqa: BLE001
-        log(f"calibrate: abort signal failed: {e}")
-        return False
-    # give the finally block a few seconds; escalate if the process hangs
-    for _ in range(30):
-        if proc.poll() is not None:
-            break
-        time.sleep(0.2)
-    else:
-        try:
-            proc.kill()
-        except Exception:  # noqa: BLE001
-            pass
-    log("calibrate: abort requested (SIGINT sent)")
-    return True
 
 
 def moonraker_pause():
@@ -422,8 +152,8 @@ def on_alert(max_conf):
             STATE["paused_print"] = True
 
 
-def annotate(frame_bytes, dets, alert, streak, bed_box=None):
-    """Draw failure boxes (+ optional bed-object box) on the frame; return jpeg bytes."""
+def annotate(frame_bytes, dets, alert, streak):
+    """Draw failure boxes on the frame; return jpeg bytes."""
     img = Image.open(io.BytesIO(frame_bytes)).convert("RGB")
     d = ImageDraw.Draw(img)
     box_col = (248, 81, 73) if alert else (210, 153, 34)
@@ -433,10 +163,6 @@ def annotate(frame_bytes, dets, alert, streak, bed_box=None):
         x0, y0, x1, y1 = cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2
         d.rectangle([x0, y0, x1, y1], outline=box_col, width=3)
         d.text((x0 + 2, max(0, y0 - 12)), f"failure {conf:.2f}", fill=box_col)
-    if bed_box:                       # cyan = "object on bed" (distinct from failure red/amber)
-        x0, y0, x1, y1 = bed_box
-        d.rectangle([x0, y0, x1, y1], outline=(57, 197, 187), width=3)
-        d.text((x0 + 2, max(0, y0 - 12)), "bed object", fill=(57, 197, 187))
     # HUD banner
     d.rectangle([0, 0, img.width, 22], fill=(20, 22, 28))
     hud = f"{'ALERT' if alert else 'OK'}  streak={streak}  {dt.datetime.now().strftime('%H:%M:%S')}"
@@ -449,13 +175,8 @@ def annotate(frame_bytes, dets, alert, streak, bed_box=None):
 def poller():
     global LATEST_JPG
     log(f"ml_api target {CFG['ML_API_URL']}  webcam {CFG['SNAPSHOT_URL']}")
-    bed_stack = BedRefStack()
-    bed_stack_loaded = time.time()
     while True:
         t0 = time.time()
-        if t0 - bed_stack_loaded > 300:   # reload every 5min: pick up new 15-min slot dirs
-            bed_stack = BedRefStack()
-            bed_stack_loaded = t0
         try:
             with LOCK:
                 conf_min = STATE["conf"]
@@ -463,18 +184,6 @@ def poller():
             score_ms = (time.time() - t0) * 1000.0
             frame = grab_frame_bytes()
             pstate, pfile = moonraker_print_state()
-
-            # bed-clear check (independent of the spaghetti model)
-            bed_occupied, bed_changed, bed_box, bed_ref_z, bed_ref_h = False, 0.0, None, None, None
-            if bed_stack.ready():
-                try:
-                    cur_z = moonraker_z()
-                    bed_ref, bed_ref_z, bed_ref_h = bed_stack.get(cur_z, slot_now())
-                    if bed_ref is not None:
-                        bed_occupied, bed_changed, bed_box = bed_detect(
-                            Image.open(io.BytesIO(frame)).convert("RGB"), bed_ref)
-                except Exception as e:  # noqa: BLE001
-                    log(f"bed: detect failed: {e}")
 
             dets, max_conf = [], 0.0
             for row in raw_dets:
@@ -488,7 +197,6 @@ def poller():
                     dets.append({"conf": round(conf, 3), "box": box})
                     max_conf = max(max_conf, conf)
             positive = len(dets) > 0
-            jpg = annotate(frame, dets, False, 0)  # banner refined after state update below
 
             fire = False
             with LOCK:
@@ -503,11 +211,6 @@ def poller():
                 if pstate is not None:
                     STATE["printer_state"] = pstate
                     STATE["printer_file"] = pfile
-                STATE["bed_ok"] = bed_stack.ready()
-                STATE["bed_occupied"] = bed_occupied
-                STATE["bed_changed"] = round(bed_changed, 4)
-                STATE["bed_ref_z"] = bed_ref_z
-                STATE["bed_ref_slot"] = bed_ref_h
                 if positive:
                     STATE["pos_streak"] += 1
                     STATE["clean_streak"] = 0
@@ -523,8 +226,7 @@ def poller():
                     STATE["alert_since"] = None
                     log("alert cleared (frames went clean)")
                 alert_now, streak_now = STATE["alert"], STATE["pos_streak"]
-            # redraw banner with final alert state (+ bed-object box)
-            LATEST_JPG = annotate(frame, dets, alert_now, streak_now, bed_box)
+            LATEST_JPG = annotate(frame, dets, alert_now, streak_now)
             if fire:
                 on_alert(max_conf)
         except Exception as e:  # noqa: BLE001
@@ -567,8 +269,7 @@ PAGE = """<!doctype html><html><head><meta charset=utf-8>
  <span class=dot id=dot></span>
  <h1>🍝 Spaghetti Detector — SV08</h1>
  <span id=badge class="badge ok">…</span>
- <span id=bedbadge class="badge" style="margin-left:auto">…</span>
- <span id=pbadge class="badge">…</span>
+ <span id=pbadge class="badge" style="margin-left:auto">…</span>
 </header>
 <div class=wrap>
  <div class=cam><img id=cam src="/snapshot.jpg" alt="camera"></div>
@@ -586,13 +287,6 @@ PAGE = """<!doctype html><html><head><meta charset=utf-8>
    </div>
    <input id=conf type=range min=5 max=95 step=1 style="width:100%;margin-top:8px" onchange=setConf(this.value)>
    <p class=hint>Lower = more sensitive (flags sooner, more false positives). Higher = stricter.</p>
-  </div>
-  <div style="margin-top:14px">
-   <button id=calibbtn onclick=calibrate()
-     style="width:100%;padding:9px;background:#0d3b3a;color:#39c5bb;border:1px solid #39c5bb;border-radius:6px;cursor:pointer;font:inherit">Capture bed reference</button>
-   <button id=calibabort onclick=abortCalib() disabled
-     style="width:100%;margin-top:6px;padding:9px;background:#3b0d0d;color:#ff7b72;border:1px solid #ff7b72;border-radius:6px;cursor:pointer;font:inherit">Abort sweep</button>
-   <p class=hint id=calibhint>One Z sweep of the current time slot (homes, parks back-left, Z 5→300). Head MOVES only while running — no schedule. Bed must be EMPTY. Press again anytime to add slots.</p>
   </div>
   <p style="margin-top:14px"><a href=/api/status>/api/status</a> · <a href=/healthz>/healthz</a></p>
  </div>
@@ -632,40 +326,6 @@ PAGE = """<!doctype html><html><head><meta charset=utf-8>
   const m=PBADGE[s.printer_state]||[s.printer_state||'?','#30363d','#8b949e'];
   b.textContent=m[0];b.style.background=m[1];b.style.color=m[2];
  }
- function paintBed(s){
-  const b=document.getElementById('bedbadge');
-  if(!s.bed_ok){b.textContent='bed: no ref';b.style.background='#30363d';b.style.color='#8b949e';return;}
-  if(s.bed_occupied){b.textContent='bed: OBJECT';b.style.background='#0d3b3a';b.style.color='#39c5bb';}
-  else{b.textContent='bed: clear';b.style.background='#1a3d1a';b.style.color='#7ee787';}
- }
- async function calibrate(){
-  const b=document.getElementById('calibbtn');
-  if(b.disabled)return;                       // already running — ignore repeat press
-  if(!confirm('Capture one empty-bed reference sweep now? The head homes, parks back-left and steps Z 5 to 300 (several min). The bed must be EMPTY. No schedule is created — this runs once.'))return;
-  b.disabled=true; b.style.opacity='0.6'; b.textContent='Starting…';   // lock immediately
-  try{
-   const r=await fetch('/api/calibrate',{method:'POST'});
-   const j=await r.json();
-   if(!r.ok){alert('Cannot calibrate: '+(j.error||r.status)); b.disabled=false; b.style.opacity='1';}
-  }catch(e){alert('calibrate failed: '+e); b.disabled=false; b.style.opacity='1';}
- }
- async function abortCalib(){
-  const a=document.getElementById('calibabort');
-  if(a.disabled)return;
-  a.disabled=true; a.textContent='Aborting…';
-  try{await fetch('/api/calib_abort',{method:'POST'});}catch(e){}
- }
- function paintCalib(s){
-  const b=document.getElementById('calibbtn'),h=document.getElementById('calibhint'),
-        a=document.getElementById('calibabort');
-  b.disabled=!!s.bed_calibrating;
-  b.textContent=s.bed_calibrating?'Calibrating… (head moving)':'Capture bed reference';
-  b.style.opacity=s.bed_calibrating?'0.6':'1';
-  a.disabled=!s.bed_calibrating||!!s.bed_calib_aborting;   // always visible; greyed when idle
-  a.style.opacity=(!s.bed_calibrating||!!s.bed_calib_aborting)?'0.5':'1';
-  if(!s.bed_calib_aborting)a.textContent='Abort sweep';
-  if(s.bed_calib_msg)h.textContent=s.bed_calib_msg;
- }
  async function refresh(){
   try{
    const s=await (await fetch('/api/status')).json();
@@ -675,8 +335,6 @@ PAGE = """<!doctype html><html><head><meta charset=utf-8>
    b.textContent=a?'ALERT — failure':(s.ml_ok?'OK':'no ml_api');
    b.className='badge '+(a?'alert':'ok');
    const rows=[
-    ['Bed',!s.bed_ok?'no reference':(s.bed_occupied?'OBJECT ('+(s.bed_changed*100).toFixed(1)+'%)':'clear')],
-    ['Bed ref',s.bed_ref_z!=null?('z'+s.bed_ref_z+' / q'+s.bed_ref_slot):'—'],
     ['Printer',s.printer_ok?s.printer_state:'unreachable'],
     ['Print file',s.printer_file||'—'],
     ['ml_api',s.ml_ok?'up':'DOWN'],['Score',s.score_ms+' ms'],
@@ -688,8 +346,6 @@ PAGE = """<!doctype html><html><head><meta charset=utf-8>
    document.getElementById('stats').innerHTML=rows.map(r=>`<tr><td class=k>${r[0]}</td><td class=v>${r[1]}</td></tr>`).join('');
    paintAP(s.auto_pause);
    paintPrinter(s);
-   paintBed(s);
-   paintCalib(s);
    const cs=document.getElementById('conf');
    if(document.activeElement!==cs){cs.value=Math.round(s.conf*100);
     document.getElementById('confval').textContent=Number(s.conf).toFixed(2);}
@@ -761,35 +417,12 @@ class Handler(BaseHTTPRequestHandler):
                 STATE["conf"] = round(val, 2)
             log(f"sensitivity set: min conf={val:.2f} via API")
             self._send(200, "application/json", json.dumps({"conf": round(val, 2)}).encode())
-        elif p == "/api/calibrate":
-            pstate, _ = moonraker_print_state()
-            if pstate == "printing":
-                self._send(409, "application/json",
-                           json.dumps({"error": "print running"}).encode())
-                return
-            with LOCK:
-                busy = STATE["bed_calibrating"]
-            if busy:
-                self._send(409, "application/json",
-                           json.dumps({"error": "already calibrating"}).encode())
-                return
-            threading.Thread(target=run_calibration, daemon=True).start()
-            log("calibrate: started via API (head will move, Z sweep)")
-            self._send(200, "application/json", json.dumps({"started": True}).encode())
-        elif p == "/api/calib_abort":
-            ok = abort_calibration()
-            if not ok:
-                self._send(409, "application/json",
-                           json.dumps({"error": "no sweep running"}).encode())
-                return
-            self._send(200, "application/json", json.dumps({"aborting": True}).encode())
         else:
             self._send(404, "text/plain", b"not found")
 
 
 def main():
     log(f"config: {json.dumps({k: v for k, v in CFG.items() if 'PASS' not in k and 'TOKEN' not in k})}")
-    purge_calib_cron()  # calibration is button-only; kill any leftover scheduled sweep
     threading.Thread(target=poller, daemon=True).start()
     srv = ThreadingHTTPServer((CFG["HOST"], CFG["PORT"]), Handler)
     log(f"serving on http://{CFG['HOST']}:{CFG['PORT']}")
